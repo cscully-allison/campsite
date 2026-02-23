@@ -8,7 +8,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 from .campsite_lib.utils import AnalysisState, log
-from .campsite_lib.analysis_graph import analysis_assistant
+from .campsite_lib.analysis_graph import analysis_assistant, direct_analysis
 from .campsite_lib.ir_parser import parse_hypothesis, hypothesis_to_dict
 from .campsite_lib.si_checkers import SICheckRunner
 from .campsite_lib.nl_extractors import NLExtractor
@@ -152,6 +152,29 @@ def create_app() -> Flask:
         })
     
     
+    @app.route("/direct_analyze", methods=["POST"])
+    def direct_analyze():
+        """Direct analysis: hypothesis → artifact with no clarification loop."""
+        data = request.get_json()
+        question = data.get("question", "")
+        data_summary = data.get("dataSummary", {})
+
+        try:
+            result_state = run_async(direct_analysis(question, data_summary))
+            vega_spec = (
+                json.loads(result_state.vega_lite_spec)
+                if result_state.vega_lite_spec
+                else None
+            )
+            return jsonify({
+                "hypothesis": result_state.hypothesis,
+                "vega_lite_spec": vega_spec,
+                "code": result_state.code,
+                "explanation": result_state.explanation,
+            })
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
     @app.route("/generate_artifact", methods=["POST"])
     def generate_artifact_endpoint():
         """Generate a visualization artifact from a hypothesis."""

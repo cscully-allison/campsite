@@ -229,6 +229,35 @@ class Campsite(anywidget.AnyWidget):
         )
         self.response = response.text
 
+    def direct_analyze(self, question: str) -> dict:
+        """
+        Run direct analysis: hypothesis translation → artifact generation.
+
+        Bypasses the conversation manager's clarification loop entirely.
+        Requires data to be loaded first via load_data() or the records setter.
+
+        Args:
+            question: Research question to analyze
+
+        Returns:
+            dict: Response with hypothesis, vega_lite_spec, code, explanation
+        """
+        import requests
+
+        response = requests.post(
+            url=f"http://localhost:{self._server.port}/direct_analyze",
+            json={
+                "question": question,
+                "dataSummary": dict(self._summary_stats),
+            },
+        )
+        result = response.json()
+
+        if "error" in result:
+            print(f"Error: {result['error']}")
+
+        return result
+
     def test_artifact_gen(self, hypothesis, contextual_information=None):
         """
         Test the artifact generator with a hypothesis.

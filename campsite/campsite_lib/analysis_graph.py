@@ -284,5 +284,24 @@ def create_analysis_graph() -> StateGraph:
     return graph.compile()
 
 
+async def direct_analysis(question: str, data_summary: dict) -> AnalysisState:
+    """Run hypothesis translation and artifact generation without clarification.
+
+    Bypasses the conversation manager entirely — takes a research question
+    straight through hypothesis_node → artifact_gen_node and returns the
+    completed state.
+    """
+    state = AnalysisState(
+        initialUserQuestion=question,
+        dataSummary=data_summary,
+        stage="hypothesis",
+    )
+
+    state = await hypothesis_node(state)
+    state = await artifact_gen_node(state)
+
+    return state
+
+
 # Compiled analysis assistant graph
 analysis_assistant = create_analysis_graph()
