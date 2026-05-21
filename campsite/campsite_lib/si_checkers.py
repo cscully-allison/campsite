@@ -22,6 +22,7 @@ from typing import Any, Optional
 
 from .utils import llm, log
 from .ir_ast import VALID_COMPARATORS
+from . import vega_utils
 
 
 # ---------------------------------------------------------------------------
@@ -45,6 +46,83 @@ class Criticality(str, Enum):
 
     WARN = "warn"
     FAIL = "fail"
+
+
+# ---------------------------------------------------------------------------
+# Semantic invariant sub-field enums
+# ---------------------------------------------------------------------------
+
+class ComparatorDirection(str, Enum):
+    GREATER = "greater"
+    LESS = "less"
+    NONE = "none"
+
+
+class ComparatorStrictness(str, Enum):
+    STRICT = "strict"
+    INCLUSIVE = "inclusive"
+    NA = "na"
+
+
+class ComparatorPolarity(str, Enum):
+    EQUAL = "equal"
+    UNEQUAL = "unequal"
+    NA = "na"
+
+
+class ComparatorForm(str, Enum):
+    BINARY = "binary"
+    RANGE = "range"
+    SET = "set"
+    UNSPECIFIED = "unspecified"
+
+
+class ReferentType(str, Enum):
+    ABSENT = "absent"
+    CONSTANT = "constant"
+    COMPUTED = "computed"
+
+
+class QuantitySignature(str, Enum):
+    LEVEL = "level"
+    CONTRAST = "contrast"
+    ASSOCIATION = "association"
+    DISTRIBUTION = "distribution"
+
+
+class QuantityShape(str, Enum):
+    VALUE = "value"
+    DIFFERENCE = "difference"
+    RATIO = "ratio"
+    RANK = "rank"
+
+
+class QuantityUncertainty(str, Enum):
+    MISSING = "missing"
+    ATTACHED = "attached"
+
+
+class ConditionRole(str, Enum):
+    FILTER = "filter"
+    CONTRAST_ARM = "contrast-arm"
+    PARTITION_KEY = "partition-key"
+    STRATIFICATION_KEY = "stratification-key"
+
+
+class ScopeValue(str, Enum):
+    NONE = "none"
+    GROUPED = "grouped"
+
+
+class PartitionStructure(str, Enum):
+    SINGLE = "single"
+    CROSSED = "crossed"
+    NESTED = "nested"
+
+
+class FrameValue(str, Enum):
+    NONE = "none"
+    STRATIFIED = "stratified"
 
 
 # Representation mapping constants
@@ -88,6 +166,43 @@ class ExtractedValue:
     exists: bool = False
     confidence: float = 1.0
     metadata: dict = field(default_factory=dict)
+
+
+@dataclass
+class ConditionRecord:
+    """A single structured condition record."""
+
+    attr: str = ""
+    role: str = ""       # One of ConditionRole values
+    values: str = ""     # "each", "{a, b}", "= x", etc.
+    ordered: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Comparator decomposition
+# ---------------------------------------------------------------------------
+
+_COMPARATOR_DECOMPOSITION: dict[str, dict[str, str]] = {
+    ">":       {"direction": "greater", "strictness": "strict",    "polarity": "na",      "form": "binary"},
+    "<":       {"direction": "less",    "strictness": "strict",    "polarity": "na",      "form": "binary"},
+    ">=":      {"direction": "greater", "strictness": "inclusive", "polarity": "na",      "form": "binary"},
+    "<=":      {"direction": "less",    "strictness": "inclusive", "polarity": "na",      "form": "binary"},
+    "=":       {"direction": "none",    "strictness": "na",       "polarity": "equal",   "form": "binary"},
+    "!=":      {"direction": "none",    "strictness": "na",       "polarity": "unequal", "form": "binary"},
+    "BETWEEN": {"direction": "none",    "strictness": "na",       "polarity": "na",      "form": "range"},
+    "IN":      {"direction": "none",    "strictness": "na",       "polarity": "na",      "form": "set"},
+}
+
+
+def decompose_comparator(operator: Optional[str]) -> dict[str, str]:
+    """Decompose a comparator operator into its 4 sub-fields.
+
+    Returns dict with keys: direction, strictness, polarity, form.
+    Returns all-unspecified for unknown/missing operators.
+    """
+    if operator and operator in _COMPARATOR_DECOMPOSITION:
+        return dict(_COMPARATOR_DECOMPOSITION[operator])
+    return {"direction": "none", "strictness": "na", "polarity": "na", "form": "unspecified"}
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +255,7 @@ def _collect_predicates(node: dict) -> list[dict]:
     if not isinstance(node, dict):
         return predicates
 
-    # Direct predicate on this node
+    # Direct predicate on this node (conditioned_expr, etc.)
     pred = node.get("predicate")
     if pred and isinstance(pred, dict):
         predicates.extend(_flatten_predicate(pred))
@@ -160,7 +275,12 @@ def _collect_predicates(node: dict) -> list[dict]:
     if isinstance(estimand, dict):
         predicates.extend(_collect_predicates(estimand))
 
-    # Recurse into lhs/rhs (for contrast nodes)
+    # Recurse into expr (for expectation and conditioned_expr nodes)
+    expr_node = node.get("expr")
+    if isinstance(expr_node, dict):
+        predicates.extend(_collect_predicates(expr_node))
+
+    # Recurse into lhs/rhs (for contrast and binary nodes)
     for side in ("lhs", "rhs"):
         child = node.get(side)
         if isinstance(child, dict):
@@ -171,7 +291,7 @@ def _collect_predicates(node: dict) -> list[dict]:
 
 def _flatten_predicate(pred: dict) -> list[dict]:
     """Flatten a possibly-conjunctive predicate into a list of simple predicates."""
-    if pred.get("kind") == "conjunction":
+    if pred.get("kind") in ("conjunction", "disjunction"):
         parts = []
         if pred.get("lhs"):
             parts.extend(_flatten_predicate(pred["lhs"]))
@@ -201,6 +321,20 @@ def _malformed_extracted(node: dict) -> ExtractedValue:
             "message": node.get("message", ""),
         },
     )
+
+
+def _extract_partition_attrs(partition: dict) -> list[str]:
+    """Extract attribute names from a partition or cross-partition dict."""
+    if not isinstance(partition, dict):
+        return []
+    if partition.get("type") == "partition":
+        attr = partition.get("attr", "")
+        return [attr] if attr else []
+    if partition.get("type") == "cross_partition":
+        lhs = _extract_partition_attrs(partition.get("lhs", {}))
+        rhs = _extract_partition_attrs(partition.get("rhs", {}))
+        return lhs + rhs
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -362,13 +496,21 @@ class CanonicalFieldChecker(ABC):
 # Concrete field checkers
 # ---------------------------------------------------------------------------
 
-class ComparatorChecker(CanonicalFieldChecker):
-    """event.comparator — Directional relation defining the hypothesis.
+# Sub-field keys for decomposed checkers
+_COMPARATOR_SUBFIELDS = ("direction", "strictness", "polarity", "form")
+_REFERENT_SUBFIELDS = ("type", "value")
+_PARTITION_SUBFIELDS = ("structure", "ordered")
 
-    Handles the thorn character 'ᚦ' as 'missing'.
+
+class ComparatorChecker(CanonicalFieldChecker):
+    """comparator — Decomposed directional relation.
+
+    Sub-invariants: direction, strictness, polarity, form.
+    Extracted as operator from IR, then decomposed programmatically.
+    Produces individual violations per sub-field mismatch.
     """
 
-    field_id = "event.comparator"
+    field_id = "comparator"
     required_in = ("IR",)
 
     def extract_from_ir(self, ir: dict) -> ExtractedValue:
@@ -376,26 +518,112 @@ class ComparatorChecker(CanonicalFieldChecker):
         if _is_error_node(event):
             return _malformed_extracted(event)
         comparator = event.get("comparator")
-        if comparator == "\u16A6":
-            return ExtractedValue(value="missing", exists=True)
-        exists = comparator is not None and comparator in VALID_COMPARATORS
-        return ExtractedValue(value=comparator, exists=exists)
+        decomposed = decompose_comparator(comparator)
+        exists = comparator is not None and (
+            comparator in VALID_COMPARATORS or comparator == "\u16A6"
+        )
+        return ExtractedValue(
+            value=decomposed, exists=exists,
+            metadata={"raw_operator": comparator},
+        )
+
+    def extract_from_artifact(self, artifact: dict) -> ExtractedValue:
+        """Vega-lite specs do not encode directional comparators."""
+        return ExtractedValue(
+            value=decompose_comparator(None), exists=True,
+        )
+
+    def check_pairwise(
+        self, source: ExtractedValue, target: ExtractedValue, pair_label: str,
+    ) -> Optional[list[Violation]]:
+        """Compare each sub-field independently. Skip artifact pairs."""
+        if "ART" in pair_label:
+            return None
+        if not source.exists or not target.exists:
+            return None
+        if not isinstance(source.value, dict) or not isinstance(target.value, dict):
+            return super().check_pairwise(source, target, pair_label)
+
+        violations = []
+        for key in _COMPARATOR_SUBFIELDS:
+            s_val = source.value.get(key)
+            t_val = target.value.get(key)
+            if s_val != t_val:
+                low_confidence = (
+                    source.confidence < self.confidence_threshold
+                    or target.confidence < self.confidence_threshold
+                )
+                violations.append(Violation(
+                    invariantID=f"comparator.{key}-{pair_label}",
+                    violationType=_PAIRWISE_VIOLATION_TYPE_MAP.get(
+                        pair_label, ViolationType.NL_IR_MISMATCH
+                    ),
+                    message=f"Comparator sub-field '{key}' differs between representations",
+                    criticality=Criticality.WARN if low_confidence else Criticality.FAIL,
+                    expected=s_val,
+                    observed=t_val,
+                ))
+        return violations if violations else None
+
+    def check(
+        self,
+        ir: Any = None,
+        nl_values: Optional[dict[str, "ExtractedValue"]] = None,
+        artifact: Optional[dict] = None,
+    ) -> list[Violation]:
+        """Run checks, flattening per-sub-field pairwise results."""
+        violations = []
+        ir_dict = _ensure_dict(ir)
+
+        nl_val = (nl_values or {}).get(self.field_id, ExtractedValue())
+        ir_val = self.extract_from_ir(ir_dict) if ir_dict else ExtractedValue()
+        art_val = self.extract_from_artifact(artifact) if artifact else ExtractedValue()
+
+        # Existence checks
+        has_nl = nl_val.exists or (nl_values is not None and self.field_id in nl_values)
+        if has_nl:
+            v = self.check_existence("NL", nl_val)
+            if v:
+                violations.append(v)
+        if ir_dict:
+            v = self.check_existence("IR", ir_val)
+            if v:
+                violations.append(v)
+        if artifact:
+            v = self.check_existence("ART", art_val)
+            if v:
+                violations.append(v)
+
+        # Pairwise checks (returns list or None)
+        for src, tgt, label in [
+            (nl_val, ir_val, "PW-NLIR"),
+            (ir_val, art_val, "PW-IRART"),
+            (nl_val, art_val, "PW-NLART"),
+        ]:
+            if label == "PW-NLIR" and not (has_nl and ir_dict):
+                continue
+            if label == "PW-IRART" and not (ir_dict and artifact):
+                continue
+            if label == "PW-NLART" and not (has_nl and artifact):
+                continue
+            result = self.check_pairwise(src, tgt, label)
+            if isinstance(result, list):
+                violations.extend(result)
+            elif result is not None:
+                violations.append(result)
+
+        return violations
 
 
 class ReferentChecker(CanonicalFieldChecker):
-    """event.referent — Reference value defining the event boundary.
+    """referent — Reference value defining the event boundary.
 
-    Categorizes the referent as: 'threshold' (Const), 'quantity' (any quantity type),
-    or 'missing' (None/Unspecified).
+    Sub-invariants: type (absent|constant|computed), value (literal or ᚦ).
+    Produces individual violations per sub-field mismatch.
     """
 
-    field_id = "event.referent"
+    field_id = "referent"
     required_in = ("IR",)
-
-    _QUANTITY_TYPE_SYNONYMS = {
-        "expectation": {"mean", "average", "expected value", "expected"},
-        "contrast": {"difference", "comparison", "gap"},
-    }
 
     def extract_from_ir(self, ir: dict) -> ExtractedValue:
         event = ir.get("event", {})
@@ -403,55 +631,137 @@ class ReferentChecker(CanonicalFieldChecker):
             return _malformed_extracted(event)
         referent = event.get("referent")
         if referent is None:
-            return ExtractedValue(value="missing", exists=True)
+            return ExtractedValue(value={"type": "absent", "value": "\u16A6"}, exists=True)
         if _is_error_node(referent):
             return _malformed_extracted(referent)
         if isinstance(referent, dict):
             if referent.get("type") == "unspecified":
-                return ExtractedValue(value="missing", exists=True, metadata={"unspecified": True})
+                return ExtractedValue(
+                    value={"type": "absent", "value": "\u16A6"},
+                    exists=True, metadata={"unspecified": True},
+                )
             if referent.get("type") == "const":
-                return ExtractedValue(value="threshold", exists=True, metadata={"const_value": referent.get("value")})
-            # Quantity referent (expectation, contrast, rv, etc.)
-            return ExtractedValue(value="quantity", exists=True, metadata={"referent_data": referent})
-        return ExtractedValue(value="threshold", exists=True)
+                return ExtractedValue(
+                    value={"type": "constant", "value": referent.get("value")},
+                    exists=True,
+                )
+            if referent.get("type") == "func":
+                return ExtractedValue(
+                    value={"type": "computed", "value": referent.get("name", "\u16A6")},
+                    exists=True,
+                )
+            # Any other type — treat as computed for forward compatibility
+            return ExtractedValue(
+                value={"type": "computed", "value": "\u16A6"},
+                exists=True, metadata={"referent_data": referent},
+            )
+        return ExtractedValue(value={"type": "constant", "value": referent}, exists=True)
 
-    def is_quantity_referent(self, ir: dict) -> bool:
-        """Check if the referent in this IR is a quantity type."""
-        event = ir.get("event", {})
-        referent = event.get("referent")
-        if not isinstance(referent, dict):
-            return False
-        return referent.get("type") not in ("const", "unspecified", "error", None)
+    def extract_from_artifact(self, artifact: dict) -> ExtractedValue:
+        """Detect referent type from vega-lite spec structural patterns."""
+        pattern = vega_utils.detect_referent_pattern(artifact)
+        type_map = {"threshold": "constant", "quantity": "computed", "missing": "absent"}
+        ref_type = type_map.get(pattern, "absent")
+        return ExtractedValue(
+            value={"type": ref_type, "value": "\u16A6"},
+            exists=True,
+            metadata={"detection_method": "structural_pattern"},
+        )
 
-    def get_referent_quantity(self, ir: dict) -> Optional[dict]:
-        """Extract the referent as a quantity dict, or None if not a quantity."""
-        event = ir.get("event", {})
-        referent = event.get("referent")
-        if not isinstance(referent, dict):
+    def check_pairwise(
+        self, source: ExtractedValue, target: ExtractedValue, pair_label: str,
+    ) -> Optional[list[Violation]]:
+        """Compare type and value sub-fields independently."""
+        if not source.exists or not target.exists:
             return None
-        if referent.get("type") in ("const", "unspecified", "error", None):
-            return None
-        return referent
+        if not isinstance(source.value, dict) or not isinstance(target.value, dict):
+            return super().check_pairwise(source, target, pair_label)
 
-    def _values_match(self, source_value: Any, target_value: Any) -> bool:
-        """Compare referent categories."""
-        # Simple category comparison (threshold, quantity, missing)
-        if isinstance(source_value, str) and isinstance(target_value, str):
-            return source_value.strip().lower() == target_value.strip().lower()
-        return source_value == target_value
+        violations = []
+        for key in _REFERENT_SUBFIELDS:
+            s_val = source.value.get(key)
+            t_val = target.value.get(key)
+            if s_val != t_val:
+                low_confidence = (
+                    source.confidence < self.confidence_threshold
+                    or target.confidence < self.confidence_threshold
+                )
+                violations.append(Violation(
+                    invariantID=f"referent.{key}-{pair_label}",
+                    violationType=_PAIRWISE_VIOLATION_TYPE_MAP.get(
+                        pair_label, ViolationType.NL_IR_MISMATCH
+                    ),
+                    message=f"Referent sub-field '{key}' differs between representations",
+                    criticality=Criticality.WARN if low_confidence else Criticality.FAIL,
+                    expected=s_val,
+                    observed=t_val,
+                ))
+        return violations if violations else None
+
+    def check(
+        self,
+        ir: Any = None,
+        nl_values: Optional[dict[str, "ExtractedValue"]] = None,
+        artifact: Optional[dict] = None,
+    ) -> list[Violation]:
+        """Run checks, flattening per-sub-field pairwise results."""
+        violations = []
+        ir_dict = _ensure_dict(ir)
+
+        nl_val = (nl_values or {}).get(self.field_id, ExtractedValue())
+        ir_val = self.extract_from_ir(ir_dict) if ir_dict else ExtractedValue()
+        art_val = self.extract_from_artifact(artifact) if artifact else ExtractedValue()
+
+        has_nl = nl_val.exists or (nl_values is not None and self.field_id in nl_values)
+        if has_nl:
+            v = self.check_existence("NL", nl_val)
+            if v:
+                violations.append(v)
+        if ir_dict:
+            v = self.check_existence("IR", ir_val)
+            if v:
+                violations.append(v)
+        if artifact:
+            v = self.check_existence("ART", art_val)
+            if v:
+                violations.append(v)
+
+        for src, tgt, label in [
+            (nl_val, ir_val, "PW-NLIR"),
+            (ir_val, art_val, "PW-IRART"),
+            (nl_val, art_val, "PW-NLART"),
+        ]:
+            if label == "PW-NLIR" and not (has_nl and ir_dict):
+                continue
+            if label == "PW-IRART" and not (ir_dict and artifact):
+                continue
+            if label == "PW-NLART" and not (has_nl and artifact):
+                continue
+            result = self.check_pairwise(src, tgt, label)
+            if isinstance(result, list):
+                violations.extend(result)
+            elif result is not None:
+                violations.append(result)
+
+        return violations
 
 
 class QuantitySignatureChecker(CanonicalFieldChecker):
-    """event.quantity.signature — What kind of quantity is being evaluated."""
+    """quantity.signature — What kind of quantity is being evaluated.
 
-    field_id = "event.quantity.signature"
+    Values: level | contrast | association | distribution.
+    Trend has been removed; temporal trends are now a composition of
+    level + grouped scope + ordered partition + directional comparator.
+    """
+
+    field_id = "quantity.signature"
     required_in = ("IR",)
 
     _SIGNATURE_MAP = {
         "expectation": "level",
         "contrast": "contrast",
         "rv": "distribution",
-        "extract": "trend",
+        "extract": "level",
     }
 
     def extract_from_ir(self, ir: dict) -> ExtractedValue:
@@ -470,102 +780,309 @@ class QuantitySignatureChecker(CanonicalFieldChecker):
         sig = self._SIGNATURE_MAP.get(qtype, "unknown")
         return ExtractedValue(value=sig, exists=(sig != "unknown"))
 
+    def extract_from_artifact(self, artifact: dict) -> ExtractedValue:
+        """Classify quantity signature from vega-lite spec.
 
-class ConditioningChecker(CanonicalFieldChecker):
-    """event.quantity.conditioning — Explicit predicates restricting the hypothesis domain."""
+        Priority: area+quant→distribution,
+        point scatter→association, point strip→distribution,
+        line/area+temporal→level (was trend, now composition),
+        grouping→contrast, default→level.
+        """
+        units = vega_utils.walk_units(artifact)
+        if not units:
+            return ExtractedValue(value=None, exists=False)
 
-    field_id = "event.quantity.conditioning"
-    required_in = ()  # Conditioning is optional
+        marks = vega_utils.extract_all_marks(artifact)
 
-    _JUDGE_PROMPT_TEMPLATE = (
-        "You are comparing conditioning predicates from two representations "
-        "of the same hypothesis.\n\n"
-        "Natural language conditions:\n{nl_json}\n\n"
-        "Structured IR predicates:\n{ir_json}\n\n"
-        "For each NL condition, determine if there is a corresponding IR predicate "
-        "that captures the same semantic intent — including the attribute being "
-        "conditioned on, the direction of comparison, and the approximate value "
-        "threshold.\n\n"
-        "Return JSON:\n"
-        '{{"match": true or false, "rationale": "<explanation>", '
-        '"pairings": [{{"nl": "...", "ir": {{}}, "matches": true or false}}, ...]}}'
-    )
+        # Line mark → level (trend is now a composition, not a signature)
+        if "line" in marks:
+            return ExtractedValue(value="level", exists=True)
 
-    def __init__(self):
-        super().__init__()
-        self._judge_override: Optional[bool] = None
+        # Area marks
+        if "area" in marks:
+            for unit in units:
+                if vega_utils.get_mark_type(unit) == "area":
+                    enc = vega_utils.get_encodings(unit)
+                    x_type = vega_utils.get_encoding_type(enc.get("x", {}))
+                    if x_type == "temporal":
+                        return ExtractedValue(value="level", exists=True)
+                    if x_type == "quantitative":
+                        return ExtractedValue(value="distribution", exists=True)
 
-    def set_judge_override(self, result: bool):
-        """Set an override for the LLM judge result, bypassing LLM calls in tests."""
-        self._judge_override = result
+        # Point marks
+        if "point" in marks:
+            for unit in units:
+                if vega_utils.get_mark_type(unit) == "point":
+                    enc = vega_utils.get_encodings(unit)
+                    x_def = enc.get("x", {})
+                    y_def = enc.get("y", {})
+                    x_type = vega_utils.get_encoding_type(x_def)
+                    y_type = vega_utils.get_encoding_type(y_def)
+                    x_agg = vega_utils.get_encoding_aggregate(x_def)
+                    y_agg = vega_utils.get_encoding_aggregate(y_def)
 
-    def clear_judge_override(self):
-        """Remove the judge override."""
-        self._judge_override = None
+                    # Both axes quantitative, no aggregation → association
+                    if (x_type == "quantitative" and y_type == "quantitative"
+                            and not x_agg and not y_agg):
+                        return ExtractedValue(value="association", exists=True)
+
+                    # Nominal/ordinal x, quantitative y, no y aggregation → distribution
+                    if (x_type in ("nominal", "ordinal")
+                            and y_type == "quantitative" and not y_agg):
+                        return ExtractedValue(value="distribution", exists=True)
+
+        # Grouping or multiple primary units → contrast
+        primary_units = [
+            u for u in units
+            if vega_utils.get_mark_type(u) not in ("rule", "text", None)
+        ]
+        if vega_utils.has_grouping(artifact) or len(primary_units) > 1:
+            return ExtractedValue(value="contrast", exists=True)
+
+        # Default: single aggregated view → level
+        return ExtractedValue(value="level", exists=True)
+
+
+class ConditionsChecker(CanonicalFieldChecker):
+    """conditions — Structured condition records with roles.
+
+    Each condition is {attr, role, values, ordered}.
+    IR signals:
+    - Predicates on ConditionedExpr → filter or contrast-arm
+    - Canonical binding rule: identical predicate on all exprs in contrast = filter
+    - ACROSS partition → partition-key
+    - WITHIN partition → stratification-key
+    Produces per-condition, per-sub-field violations.
+    """
+
+    field_id = "conditions"
+    required_in = ()  # Conditions are optional
 
     def extract_from_ir(self, ir: dict) -> ExtractedValue:
+        """Extract conditions from IR with role assignment."""
+        conditions: list[dict] = []
         event = ir.get("event", {})
         if _is_error_node(event):
             return _malformed_extracted(event)
+
+        quantity = event.get("quantity", {}) or {}
         predicates = _collect_predicates(event)
 
-        return ExtractedValue(value=predicates, exists=len(predicates) > 0)
+        # Determine roles for predicates
+        is_contrast = isinstance(quantity, dict) and quantity.get("type") == "contrast"
+        if is_contrast:
+            lhs_preds = _collect_predicates(quantity.get("lhs", {}))
+            rhs_preds = _collect_predicates(quantity.get("rhs", {}))
+            lhs_attrs = {p.get("attr") for p in lhs_preds}
+            rhs_attrs = {p.get("attr") for p in rhs_preds}
+            shared_attrs = lhs_attrs & rhs_attrs
 
-    def _values_match(self, source_value: Any, target_value: Any) -> bool:
-        """Compare conditioning between representations.
-
-        Fast path for dict-vs-dict (attr name comparison).
-        LLM judge for mixed types (NL strings vs IR dicts).
-        """
-        if not isinstance(source_value, list) or not isinstance(target_value, list):
-            return source_value == target_value
-
-        has_dicts = any(isinstance(p, dict) for p in source_value + target_value)
-        has_strings = any(isinstance(p, str) for p in source_value + target_value)
-
-        if has_dicts and not has_strings:
-            # Both sides are dicts — fast deterministic comparison by attr names
-            source_attrs = sorted(p.get("attr", "") for p in source_value if isinstance(p, dict))
-            target_attrs = sorted(p.get("attr", "") for p in target_value if isinstance(p, dict))
-            return source_attrs == target_attrs
-
-        # Mixed types — quick count check before LLM
-        if len(source_value) != len(target_value):
-            return False
-
-        return self._llm_judge_conditions(source_value, target_value)
-
-    def _llm_judge_conditions(self, source: list, target: list) -> bool:
-        """Use LLM to judge semantic equivalence of NL vs IR conditions."""
-        if self._judge_override is not None:
-            return self._judge_override
-
-        # Determine which side is NL strings and which is IR dicts
-        if any(isinstance(p, str) for p in source):
-            nl_conditions, ir_predicates = source, target
+            for pred in predicates:
+                attr = pred.get("attr", "")
+                role = "filter" if attr in shared_attrs else "contrast-arm"
+                conditions.append({
+                    "attr": attr,
+                    "role": role,
+                    "values": str(pred.get("value", "")),
+                    "ordered": False,
+                })
         else:
-            nl_conditions, ir_predicates = target, source
+            for pred in predicates:
+                conditions.append({
+                    "attr": pred.get("attr", ""),
+                    "role": "filter",
+                    "values": str(pred.get("value", "")),
+                    "ordered": False,
+                })
 
-        prompt = self._JUDGE_PROMPT_TEMPLATE.format(
-            nl_json=json.dumps(nl_conditions, indent=2),
-            ir_json=json.dumps(ir_predicates, indent=2),
+        # Extract partition-key from across_partition
+        across = ir.get("across_partition")
+        if isinstance(across, dict):
+            for part_attr in _extract_partition_attrs(across):
+                conditions.append({
+                    "attr": part_attr,
+                    "role": "partition-key",
+                    "values": "each",
+                    "ordered": False,
+                })
+
+        # Extract stratification-key from within_partition
+        within = ir.get("within_partition")
+        if isinstance(within, dict):
+            for part_attr in _extract_partition_attrs(within):
+                conditions.append({
+                    "attr": part_attr,
+                    "role": "stratification-key",
+                    "values": "each",
+                    "ordered": False,
+                })
+
+        return ExtractedValue(value=conditions, exists=len(conditions) > 0)
+
+    def extract_from_artifact(self, artifact: dict) -> ExtractedValue:
+        """Extract conditions from vega-lite spec with role assignment."""
+        conditions: list[dict] = []
+        seen_fields: set[str] = set()
+
+        # Filter transforms → filter role
+        for ft in vega_utils.get_filter_transforms(artifact):
+            filter_val = ft.get("filter")
+            if isinstance(filter_val, dict):
+                field_name = filter_val.get("field", "?")
+                if field_name not in seen_fields:
+                    conditions.append({
+                        "attr": field_name,
+                        "role": "filter",
+                        "values": str(filter_val.get("equal", filter_val.get("gte", ""))),
+                        "ordered": False,
+                    })
+                    seen_fields.add(field_name)
+            elif isinstance(filter_val, str) and filter_val not in seen_fields:
+                conditions.append({
+                    "attr": filter_val,
+                    "role": "filter",
+                    "values": "",
+                    "ordered": False,
+                })
+                seen_fields.add(filter_val)
+
+        # Color grouping fields → partition-key
+        for field_name in vega_utils.get_color_grouping_fields(artifact):
+            if field_name not in seen_fields:
+                conditions.append({
+                    "attr": field_name,
+                    "role": "partition-key",
+                    "values": "each",
+                    "ordered": False,
+                })
+                seen_fields.add(field_name)
+
+        # Facet fields → stratification-key
+        for field_name in vega_utils.get_facet_fields(artifact):
+            if field_name not in seen_fields:
+                conditions.append({
+                    "attr": field_name,
+                    "role": "stratification-key",
+                    "values": "each",
+                    "ordered": False,
+                })
+                seen_fields.add(field_name)
+
+        return ExtractedValue(
+            value=conditions,
+            exists=len(conditions) > 0,
+            metadata={"source": "artifact_structural"},
         )
-        try:
-            response = llm.invoke(prompt)
-            resp = json.loads(response.content)
-            return resp.get("match", False)
-        except Exception as e:
-            log(f"LLM judge failed for conditioning (assuming match): {e}\n")
-            return True
+
+    def check_pairwise(
+        self, source: ExtractedValue, target: ExtractedValue, pair_label: str,
+    ) -> Optional[list[Violation]]:
+        """Match conditions by attr, then compare sub-fields independently."""
+        if not source.exists or not target.exists:
+            return None
+        if not isinstance(source.value, list) or not isinstance(target.value, list):
+            return super().check_pairwise(source, target, pair_label)
+
+        violations = []
+        low_confidence = (
+            source.confidence < self.confidence_threshold
+            or target.confidence < self.confidence_threshold
+        )
+        crit = Criticality.WARN if low_confidence else Criticality.FAIL
+        vtype = _PAIRWISE_VIOLATION_TYPE_MAP.get(pair_label, ViolationType.NL_IR_MISMATCH)
+
+        # Index conditions by attr
+        s_by_attr = {c.get("attr", ""): c for c in source.value if isinstance(c, dict)}
+        t_by_attr = {c.get("attr", ""): c for c in target.value if isinstance(c, dict)}
+
+        all_attrs = set(s_by_attr.keys()) | set(t_by_attr.keys())
+        for attr in sorted(all_attrs):
+            s_cond = s_by_attr.get(attr)
+            t_cond = t_by_attr.get(attr)
+
+            if s_cond and not t_cond:
+                # Present in source but missing in target
+                target_rep = pair_label.split("-")[-1]  # e.g., "NLIR" → last part
+                violations.append(Violation(
+                    invariantID=f"conditions[{attr}]-MISSING-{target_rep}",
+                    violationType=vtype,
+                    message=f"Condition on '{attr}' present in source but missing in target",
+                    criticality=crit,
+                    expected=s_cond,
+                    observed=None,
+                ))
+                continue
+            if t_cond and not s_cond:
+                source_rep = pair_label.split("-")[-1][:2] if len(pair_label.split("-")) > 1 else ""
+                violations.append(Violation(
+                    invariantID=f"conditions[{attr}]-MISSING-{source_rep}",
+                    violationType=vtype,
+                    message=f"Condition on '{attr}' present in target but missing in source",
+                    criticality=crit,
+                    expected=None,
+                    observed=t_cond,
+                ))
+                continue
+
+            # Both present — compare sub-fields
+            for key in ("role", "values", "ordered"):
+                s_val = s_cond.get(key)
+                t_val = t_cond.get(key)
+                if s_val != t_val:
+                    violations.append(Violation(
+                        invariantID=f"conditions[{attr}].{key}-{pair_label}",
+                        violationType=vtype,
+                        message=f"Condition '{attr}' sub-field '{key}' differs",
+                        criticality=crit,
+                        expected=s_val,
+                        observed=t_val,
+                    ))
+
+        return violations if violations else None
+
+    def check(
+        self,
+        ir: Any = None,
+        nl_values: Optional[dict[str, "ExtractedValue"]] = None,
+        artifact: Optional[dict] = None,
+    ) -> list[Violation]:
+        """Run checks, flattening per-condition pairwise results."""
+        violations = []
+        ir_dict = _ensure_dict(ir)
+
+        nl_val = (nl_values or {}).get(self.field_id, ExtractedValue())
+        ir_val = self.extract_from_ir(ir_dict) if ir_dict else ExtractedValue()
+        art_val = self.extract_from_artifact(artifact) if artifact else ExtractedValue()
+
+        has_nl = nl_val.exists or (nl_values is not None and self.field_id in nl_values)
+
+        for src, tgt, label in [
+            (nl_val, ir_val, "PW-NLIR"),
+            (ir_val, art_val, "PW-IRART"),
+            (nl_val, art_val, "PW-NLART"),
+        ]:
+            if label == "PW-NLIR" and not (has_nl and ir_dict):
+                continue
+            if label == "PW-IRART" and not (ir_dict and artifact):
+                continue
+            if label == "PW-NLART" and not (has_nl and artifact):
+                continue
+            result = self.check_pairwise(src, tgt, label)
+            if isinstance(result, list):
+                violations.extend(result)
+            elif result is not None:
+                violations.append(result)
+
+        return violations
 
 
 class ShapeChecker(CanonicalFieldChecker):
-    """event.quantity.shape — Algebraic structure of the quantity.
+    """quantity.shape — Algebraic structure of the quantity.
 
-    Simplified categories: value, ratio, difference.
+    Categories: value, difference, ratio, rank.
     """
 
-    field_id = "event.quantity.shape"
+    field_id = "quantity.shape"
     required_in = ("IR",)
 
     _OP_SHAPE_MAP = {
@@ -611,16 +1128,42 @@ class ShapeChecker(CanonicalFieldChecker):
 
         return ExtractedValue(value="unknown", exists=False)
 
+    def extract_from_artifact(self, artifact: dict) -> ExtractedValue:
+        """Detect quantity shape from vega-lite spec.
+
+        Calculate transform with division → ratio.
+        Composition (concat/multi-layer) → difference.
+        Default → value.
+        """
+        if vega_utils.has_division_calculate(artifact):
+            return ExtractedValue(value="ratio", exists=True)
+
+        has_concat = bool(
+            artifact.get("hconcat") or artifact.get("vconcat")
+            or artifact.get("concat")
+        )
+        if has_concat:
+            return ExtractedValue(value="difference", exists=True)
+
+        units = vega_utils.walk_units(artifact)
+        if len(units) > 1:
+            primary_marks = [
+                vega_utils.get_mark_type(u) for u in units
+                if vega_utils.get_mark_type(u) not in ("rule", "text", None)
+            ]
+            if len(primary_marks) >= 2:
+                return ExtractedValue(value="difference", exists=True)
+
+        return ExtractedValue(value="value", exists=True)
+
 
 class UncertaintyChecker(CanonicalFieldChecker):
-    """event.quantity.uncertainty — How uncertainty relates to the quantity.
+    """quantity.uncertainty — How uncertainty relates to the quantity.
 
-    Categories: missing (no uncertainty), attached (RV wrapping quantity),
-    detached (NL/Artifact only — uncertainty mentioned but not structurally attached).
-    In IR, uncertainty is always 'attached' (type=rv) or 'missing'.
+    Categories: missing (no uncertainty), attached (RV wrapping quantity).
     """
 
-    field_id = "event.quantity.uncertainty"
+    field_id = "quantity.uncertainty"
     required_in = ("IR",)
 
     def extract_from_ir(self, ir: dict) -> ExtractedValue:
@@ -635,98 +1178,182 @@ class UncertaintyChecker(CanonicalFieldChecker):
             value="attached" if is_rv else "missing", exists=True
         )
 
+    def extract_from_artifact(self, artifact: dict) -> ExtractedValue:
+        """Detect uncertainty encoding in vega-lite spec.
 
-class EventFormChecker(CanonicalFieldChecker):
-    """event.form — Structural form of the event, derived from component check results.
+        Area/rule marks with y+y2 → attached. Otherwise → missing.
+        """
+        if vega_utils.has_uncertainty_encoding(artifact):
+            return ExtractedValue(value="attached", exists=True)
+        return ExtractedValue(value="missing", exists=True)
 
-    Four valid forms:
-    - quantity_comp_threshold: quantity comparator threshold
-    - quantity_comp_quantity: quantity comparator quantity
-    - quantity_comp_threshold_conditioned: with conditioning on quantity
-    - quantity_comp_quantity_conditioned: with conditioning on either/both quantities
+
+class ScopeChecker(CanonicalFieldChecker):
+    """scope — Whether the quantity is distributed across partition levels.
+
+    Values: none | grouped.
     """
 
-    field_id = "event.form"
-    required_in = ("IR",)
+    field_id = "scope"
+    required_in = ()
 
     def extract_from_ir(self, ir: dict) -> ExtractedValue:
-        """Classify the structural form of the event from IR."""
-        event = ir.get("event", {})
-        if _is_error_node(event):
-            return _malformed_extracted(event)
-        if not event:
+        """Scope is 'grouped' when across_partition is present."""
+        across = ir.get("across_partition")
+        scope = "grouped" if across is not None else "none"
+        return ExtractedValue(value=scope, exists=True)
+
+    def extract_from_artifact(self, artifact: dict) -> ExtractedValue:
+        """Detect scope from vega-lite spec."""
+        if vega_utils.has_grouping(artifact):
+            return ExtractedValue(value="grouped", exists=True)
+        if len(vega_utils.get_facet_fields(artifact)) > 0:
+            return ExtractedValue(value="grouped", exists=True)
+        return ExtractedValue(value="none", exists=True)
+
+
+class PartitionChecker(CanonicalFieldChecker):
+    """partition — Structure and ordering of the partition (when scope=grouped).
+
+    Sub-invariants:
+    - partition.structure: single | crossed | nested
+    - partition.ordered: true | false
+    Produces individual violations per sub-field mismatch.
+    """
+
+    field_id = "partition"
+    required_in = ()
+
+    def extract_from_ir(self, ir: dict) -> ExtractedValue:
+        """Extract partition structure from IR."""
+        across = ir.get("across_partition")
+        if across is None:
+            return ExtractedValue(value=None, exists=False)
+        if isinstance(across, dict):
+            if across.get("type") == "cross_partition":
+                structure = "crossed"
+            else:
+                structure = "single"
+        else:
+            structure = "single"
+        return ExtractedValue(
+            value={"structure": structure, "ordered": False},
+            exists=True,
+        )
+
+    def extract_from_artifact(self, artifact: dict) -> ExtractedValue:
+        """Extract partition structure from vega-lite spec.
+
+        Uses color grouping fields and aggregate groupby fields to
+        determine how many grouping dimensions exist.
+        """
+        dimensions: set[str] = set()
+        for f in vega_utils.get_color_grouping_fields(artifact):
+            dimensions.add(f)
+        for f in vega_utils.get_aggregate_groupby_fields(artifact):
+            dimensions.add(f)
+
+        if not dimensions:
             return ExtractedValue(value=None, exists=False)
 
-        # Determine referent type
-        referent = event.get("referent") or {}
-        is_quantity_referent = (
-            isinstance(referent, dict)
-            and referent.get("type") not in ("const", "unspecified", "error", None)
+        structure = "single" if len(dimensions) == 1 else "crossed"
+        ordered = vega_utils.detect_partition_ordering(artifact)
+        return ExtractedValue(
+            value={"structure": structure, "ordered": ordered},
+            exists=True,
         )
 
-        # Determine conditioning
-        quantity = event.get("quantity", {}) or {}
-        has_event_pred = event.get("predicate") is not None
-        has_quantity_conditioning = _has_conditioning(quantity)
-        has_referent_conditioning = (
-            is_quantity_referent and _has_conditioning(referent)
-        )
-        is_conditioned = has_event_pred or has_quantity_conditioning or has_referent_conditioning
+    def check_pairwise(
+        self, source: ExtractedValue, target: ExtractedValue, pair_label: str,
+    ) -> Optional[list[Violation]]:
+        """Compare partition sub-fields independently."""
+        if not source.exists or not target.exists:
+            return None
+        if not isinstance(source.value, dict) or not isinstance(target.value, dict):
+            return super().check_pairwise(source, target, pair_label)
 
-        if is_quantity_referent:
-            if is_conditioned:
-                form = "quantity_comp_quantity_conditioned"
-            else:
-                form = "quantity_comp_quantity"
-        else:
-            if is_conditioned:
-                form = "quantity_comp_threshold_conditioned"
-            else:
-                form = "quantity_comp_threshold"
+        violations = []
+        for key in _PARTITION_SUBFIELDS:
+            s_val = source.value.get(key)
+            t_val = target.value.get(key)
+            if s_val != t_val:
+                low_confidence = (
+                    source.confidence < self.confidence_threshold
+                    or target.confidence < self.confidence_threshold
+                )
+                violations.append(Violation(
+                    invariantID=f"partition.{key}-{pair_label}",
+                    violationType=_PAIRWISE_VIOLATION_TYPE_MAP.get(
+                        pair_label, ViolationType.NL_IR_MISMATCH
+                    ),
+                    message=f"Partition sub-field '{key}' differs between representations",
+                    criticality=Criticality.WARN if low_confidence else Criticality.FAIL,
+                    expected=s_val,
+                    observed=t_val,
+                ))
+        return violations if violations else None
 
-        return ExtractedValue(value=form, exists=True)
-
-    def check_with_component_violations(
+    def check(
         self,
         ir: Any = None,
-        nl_values: Optional[dict[str, ExtractedValue]] = None,
+        nl_values: Optional[dict[str, "ExtractedValue"]] = None,
         artifact: Optional[dict] = None,
-        component_violations: Optional[list[Violation]] = None,
     ) -> list[Violation]:
-        """Run event form check, incorporating component violation results.
+        """Run checks, flattening per-sub-field pairwise results."""
+        violations = []
+        ir_dict = _ensure_dict(ir)
 
-        If component violations indicate compromised fields, the form
-        is flagged as compromised.
-        """
-        violations = self.check(ir=ir, nl_values=nl_values, artifact=artifact)
+        nl_val = (nl_values or {}).get(self.field_id, ExtractedValue())
+        ir_val = self.extract_from_ir(ir_dict) if ir_dict else ExtractedValue()
+        art_val = self.extract_from_artifact(artifact) if artifact else ExtractedValue()
 
-        if component_violations:
-            compromised_fields = [v.invariantID for v in component_violations]
+        has_nl = nl_val.exists or (nl_values is not None and self.field_id in nl_values)
 
-            # Check which components are compromised
-            has_comparator_issue = any("event.comparator" in f for f in compromised_fields)
-            has_referent_issue = any("event.referent" in f for f in compromised_fields)
-            has_quantity_issue = any("event.quantity" in f for f in compromised_fields)
-
-            compromised_components = []
-            if has_comparator_issue:
-                compromised_components.append("comparator")
-            if has_referent_issue:
-                compromised_components.append("referent")
-            if has_quantity_issue:
-                compromised_components.append("quantity")
-
-            if compromised_components:
-                violations.append(Violation(
-                    invariantID=f"{self.field_id}-COMPROMISED",
-                    violationType=ViolationType.MALFORMED,
-                    message=f"Event form is compromised due to violations in: {', '.join(compromised_components)}",
-                    criticality=Criticality.FAIL,
-                    expected="all components valid",
-                    observed=f"violations in {compromised_components}",
-                ))
+        for src, tgt, label in [
+            (nl_val, ir_val, "PW-NLIR"),
+            (ir_val, art_val, "PW-IRART"),
+            (nl_val, art_val, "PW-NLART"),
+        ]:
+            if label == "PW-NLIR" and not (has_nl and ir_dict):
+                continue
+            if label == "PW-IRART" and not (ir_dict and artifact):
+                continue
+            if label == "PW-NLART" and not (has_nl and artifact):
+                continue
+            result = self.check_pairwise(src, tgt, label)
+            if isinstance(result, list):
+                violations.extend(result)
+            elif result is not None:
+                violations.append(result)
 
         return violations
+
+
+class FrameChecker(CanonicalFieldChecker):
+    """frame — Whether stratification is applied.
+
+    Values: none | stratified.
+    Observable when within_partition is present.
+    """
+
+    field_id = "frame"
+    required_in = ()
+
+    def extract_from_ir(self, ir: dict) -> ExtractedValue:
+        """Frame is 'stratified' when within_partition is present."""
+        within = ir.get("within_partition")
+        frame = "stratified" if within is not None else "none"
+        return ExtractedValue(value=frame, exists=True)
+
+    def extract_from_artifact(self, artifact: dict) -> ExtractedValue:
+        """Detect frame from vega-lite spec.
+
+        Faceted layouts indicate stratification.
+        """
+        facets = vega_utils.get_facet_fields(artifact)
+        if len(facets) > 0:
+            return ExtractedValue(value="stratified", exists=True)
+        return ExtractedValue(value="none", exists=True)
 
 
 # ---------------------------------------------------------------------------
@@ -734,32 +1361,22 @@ class EventFormChecker(CanonicalFieldChecker):
 # ---------------------------------------------------------------------------
 
 class SICheckRunner:
-    """Orchestrates all canonical field checks with ordered execution.
+    """Orchestrates all semantic invariant checks.
 
-    Phase 1: Quantity tests → Comparator → Referent (with referent recursion)
-    Phase 2: EventFormChecker (derives from Phase 1 violations)
+    No phased execution — all checkers are independent and run in a flat loop.
     """
 
     def __init__(self):
-        # Quantity checkers (run on main quantity and optionally on referent quantity)
-        self.quantity_checkers: list[CanonicalFieldChecker] = [
+        self._all_checkers: list[CanonicalFieldChecker] = [
+            ComparatorChecker(),
+            ReferentChecker(),
             QuantitySignatureChecker(),
-            ConditioningChecker(),
             ShapeChecker(),
             UncertaintyChecker(),
-        ]
-        # Component checkers
-        self.comparator_checker = ComparatorChecker()
-        self.referent_checker = ReferentChecker()
-        # Derived checker
-        self.form_checker = EventFormChecker()
-
-        # All checkers for lookup
-        self._all_checkers: list[CanonicalFieldChecker] = [
-            self.comparator_checker,
-            self.referent_checker,
-            *self.quantity_checkers,
-            self.form_checker,
+            ConditionsChecker(),
+            ScopeChecker(),
+            PartitionChecker(),
+            FrameChecker(),
         ]
 
     def run_all(
@@ -768,68 +1385,14 @@ class SICheckRunner:
         nl_values: Optional[dict[str, ExtractedValue]] = None,
         artifact: Optional[dict] = None,
     ) -> list[Violation]:
-        """Run all checks with ordered execution.
-
-        Phase 1: quantity checks, comparator, referent (+ referent quantity recursion)
-        Phase 2: event form (derived from Phase 1 violations)
-        """
+        """Run all semantic invariant checks."""
         ir_dict = _ensure_dict(ir)
-        component_violations: list[Violation] = []
-
-        # Phase 1a: Quantity checks on main quantity
-        component_violations.extend(
-            self._run_quantity_checks(ir_dict, nl_values, artifact)
-        )
-
-        # Phase 1b: Comparator check
-        component_violations.extend(
-            self.comparator_checker.check(ir=ir_dict, nl_values=nl_values, artifact=artifact)
-        )
-
-        # Phase 1c: Referent check
-        component_violations.extend(
-            self.referent_checker.check(ir=ir_dict, nl_values=nl_values, artifact=artifact)
-        )
-
-        # Phase 1d: If referent is a quantity, run quantity checks on it too
-        if self.referent_checker.is_quantity_referent(ir_dict):
-            referent_quantity = self.referent_checker.get_referent_quantity(ir_dict)
-            if referent_quantity:
-                # Wrap referent quantity into synthetic IR for quantity checkers
-                synthetic_ir = {
-                    "type": "hypothesis",
-                    "event": {
-                        "type": "comparison",
-                        "quantity": referent_quantity,
-                        "comparator": ir_dict.get("event", {}).get("comparator"),
-                        "referent": None,
-                        "predicate": None,
-                    },
-                }
-                # Remap nl_values: convert "event.referent.quantity.*" keys
-                # back to "event.quantity.*" so quantity checkers find them
-                referent_nl_values = None
-                if nl_values:
-                    referent_nl_values = {}
-                    prefix = "event.referent."
-                    for key, val in nl_values.items():
-                        if key.startswith(prefix):
-                            referent_nl_values[f"event.{key[len(prefix):]}"] = val
-                referent_violations = self._run_quantity_checks(
-                    synthetic_ir, referent_nl_values or None, artifact
-                )
-                # Prefix violation IDs for referent quantity
-                for v in referent_violations:
-                    v.invariantID = f"event.referent.{v.invariantID.removeprefix('event.')}"
-                component_violations.extend(referent_violations)
-
-        # Phase 2: Event form check (derived from component violations)
-        form_violations = self.form_checker.check_with_component_violations(
-            ir=ir_dict, nl_values=nl_values, artifact=artifact,
-            component_violations=component_violations,
-        )
-
-        return component_violations + form_violations
+        violations: list[Violation] = []
+        for checker in self._all_checkers:
+            violations.extend(
+                checker.check(ir=ir_dict, nl_values=nl_values, artifact=artifact)
+            )
+        return violations
 
     def run_ir_only(self, ir: Any) -> list[Violation]:
         """Run checks using only the IR representation."""
@@ -845,22 +1408,6 @@ class SICheckRunner:
         """Run checks for a specific canonical field."""
         for checker in self._all_checkers:
             if checker.field_id == field_id:
-                if isinstance(checker, EventFormChecker):
-                    # Event form needs component violations
-                    component_violations = []
-                    ir_dict = _ensure_dict(ir)
-                    for c in self.quantity_checkers:
-                        component_violations.extend(c.check(ir=ir_dict, nl_values=nl_values, artifact=artifact))
-                    component_violations.extend(
-                        self.comparator_checker.check(ir=ir_dict, nl_values=nl_values, artifact=artifact)
-                    )
-                    component_violations.extend(
-                        self.referent_checker.check(ir=ir_dict, nl_values=nl_values, artifact=artifact)
-                    )
-                    return checker.check_with_component_violations(
-                        ir=ir_dict, nl_values=nl_values, artifact=artifact,
-                        component_violations=component_violations,
-                    )
                 return checker.check(ir=ir, nl_values=nl_values, artifact=artifact)
         return []
 
@@ -870,15 +1417,3 @@ class SICheckRunner:
             if checker.field_id == field_id:
                 return checker
         return None
-
-    def _run_quantity_checks(
-        self,
-        ir_dict: dict,
-        nl_values: Optional[dict[str, ExtractedValue]] = None,
-        artifact: Optional[dict] = None,
-    ) -> list[Violation]:
-        """Run all 4 quantity checkers on an IR dict."""
-        violations = []
-        for checker in self.quantity_checkers:
-            violations.extend(checker.check(ir=ir_dict, nl_values=nl_values, artifact=artifact))
-        return violations

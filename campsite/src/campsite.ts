@@ -6,6 +6,57 @@ import { hy } from "zod/locales";
 
 const padding = 10;
 
+
+/**
+ * Insert hypothesis (markdown) and code cells into the notebook.
+ * Primary path: JupyterLab shared-model API for immediate insertion.
+ * Fallback: sends a message to the Python widget for deferred insertion.
+ */
+function insertNotebookCells(
+    widgetModel: WidgetModel,
+    widgetEl: HTMLElement,
+    hypothesis: string,
+    code: string
+): void {
+    try {
+        // JupyterLab path: access notebook shared model via widget manager internals
+        const wm = (widgetModel as any).widget_manager;
+        const sharedModel = wm._context.model.sharedModel;
+
+        // Find the index of the cell containing this widget
+        const cellEl = widgetEl.closest('.jp-Cell');
+        let cellIndex = -1;
+        if (cellEl) {
+            const notebook = cellEl.closest('.jp-Notebook');
+            if (notebook) {
+                const cells = notebook.querySelectorAll('.jp-Cell');
+                cells.forEach((cell: Element, idx: number) => {
+                    if (cell === cellEl) cellIndex = idx;
+                });
+            }
+        }
+
+        // Insert after the widget cell (or at the end if we couldn't find it)
+        const insertIndex = cellIndex >= 0 ? cellIndex + 1 : sharedModel.cells.length;
+
+        sharedModel.insertCells(insertIndex, [
+            { cell_type: 'markdown', source: `## Translated Hypothesis\n${hypothesis}`, metadata: {} },
+            { cell_type: 'code', source: code, metadata: {} },
+        ]);
+
+        console.log("Inserted cells via JupyterLab shared model");
+    } catch (e) {
+        // Fallback: send to Python for deferred cell creation
+        console.warn("JupyterLab cell insertion failed, falling back to Python:", e);
+        widgetModel.send({
+            type: "create_cells",
+            hypothesis: hypothesis,
+            code: code,
+        });
+    }
+}
+
+
 class CSModel{
     data:any;
     response: any;
@@ -41,15 +92,21 @@ class ChatInterface {
     svg: any;
     session_info: any;
     awaiting_response: boolean;
+    anywidget_model: WidgetModel;
+    widget_el: HTMLElement;
 
     constructor(
         model: CSModel,
         svg: any,
-        session_info: Object
+        session_info: Object,
+        anywidget_model: WidgetModel,
+        widget_el: HTMLElement
     ) {
         this.model = model;
         this.svg = svg;
         this.session_info = session_info;
+        this.anywidget_model = anywidget_model;
+        this.widget_el = widget_el;
         this.createChatInterface();
         this.awaiting_response = false;
     }
@@ -118,6 +175,12 @@ class ChatInterface {
 
         if (!response["waiting"]) {
             this.model.update_response(response);
+            insertNotebookCells(
+                this.anywidget_model,
+                this.widget_el,
+                response["hypothesis"],
+                response["code"]
+            );
         }
         else{    
             let responseBlock = d3.select(messagesDiv).append("div")
@@ -150,7 +213,7 @@ class ChatInterface {
         const self = this;
 
         const buttonHeight = 30;
-        const width = +this.svg.attr("width") / 2;
+        const width = +this.svg.attr("width");
         const height = +this.svg.attr("height") - buttonHeight;
 
         const dimensions = {
@@ -256,121 +319,6 @@ class ChatInterface {
 }
 
 
-class CodeDisplayInterface{
-    model:any;
-    svg:any;
-    dimensions:Object;
-    disp_grp:any;
-    text_area:any;
-
-
-    constructor(model:any, svg:any, session_info:Object){
-        this.model = model;
-        this.svg = svg;
-        this.dimensions = {};
-        this.disp_grp = null;
-
-        this.createDisplay();   
-    }
-
-    toHash(string:string) {
-        return string.split('').reduce((hash, char) => {
-            return char.charCodeAt(0) + (hash << 6) + (hash << 16) - hash;
-        }, 0);
-    }
-
-
-    createDisplay(){
-        const self = this;
-        const width = +this.svg.attr("width")/2 - padding;
-        const height = +this.svg.attr("height");
-
-        
-        const dimensions = {
-            codeWindowWidth: width - 2 * padding,
-            codeWindowHeight: height - 2 * padding,
-            textAreaWidth: width - 4 * padding,
-            textAreaHeight: height - 4 * padding
-        };
-
-        this.dimensions = dimensions;
-
-        this.disp_grp = this.svg.append('g')
-                                .attr('class', 'display-grp')
-                                .attr('transform', `translate(${width+2*padding},${0})`);
-
-        this.disp_grp.append("rect")
-                .attr("x", padding)
-                .attr("y", padding)
-                .attr("width", dimensions.codeWindowWidth)
-                .attr("height", dimensions.codeWindowHeight)
-                .attr("fill", "#f9f9f9")
-                .attr("stroke", "#ccc");
-
-        this.text_area = this.disp_grp.append("foreignObject")
-                            .attr("x", padding * 2)
-                            .attr("y", padding * 2)
-                            .attr("width", dimensions.textAreaWidth-padding)
-                            .attr("height", dimensions.textAreaHeight)
-                            .append("xhtml:div")
-                            .style("overflow-y", "auto")
-                            .style("height", `${dimensions.textAreaHeight}px`)
-                            .style("width", `${dimensions.textAreaWidth-padding}px`)
-                            .style("font-family", "Arial, sans-serif")
-                            .style("font-size", "12px")
-                            .style("color", "#333")
-                            .attr("class", "chat-messages");
-
-        this.disp_grp.append('text')
-                .text('The agents will output code here for you to copy and paste. :)')
-                .attr('transform', `translate(${padding*2},${padding*4})`)
-
-    }
-
-    render(){
-        const self = this;
-        this.disp_grp.selectAll('text').remove();
-        // console.log("rendercalled", this.model.response);
-
-        console.log("This model updating in render:", this.model.response);
-
-        this.text_area.selectAll('.chat-text')
-            .data([this.model.response], (d:any)=>{this.toHash(d.hypothesis)})
-            .join(
-                (enter:any) => {
-                    let hyp_div = enter.append("div")
-                         .style('text-align', "left")
-                         .style('margin-bottom', "10px")
-                    hyp_div.append("strong")
-                            .text("Translated Hypothesis:")
-                    hyp_div.append("br");
-                    hyp_div.append("div")
-                         .style('margin-left', "10px")
-                         .style('background-color', "#f4f4f4")
-                         .style('padding', "10px")
-                         .style('border', "1px solid #ddd") 
-                         .html((d:any)=>`${marked(d.hypothesis)}`);
-                         
-
-                    let code_div = enter.append("div")
-                         .style('text-align', "left")
-                         .style('margin-bottom', "10px")
-                    code_div.append("strong")
-                            .text("Generated Code:")
-                    code_div.append("br");
-                    code_div.append("div")
-                         .style('margin-left', "10px")
-                         .style('background-color', "#f4f4f4")
-                         .style('padding', "10px")
-                         .style('border', "1px solid #ddd") 
-                         .html((d:any)=>`${marked(d.code)}`);
-                    },
-                (update:any) => {update},
-                (exit:any) => {exit.remove()}
-            )
-    }
-}
-
 // Update the WidgetModel interface to match the expected signature of the 'on' method
 interface WidgetModel extends AnyModel {
   get(key: string): any;
@@ -394,18 +342,16 @@ export function render({
   const svg = d3
     .select(el)
     .append("svg")
-    .attr("width", 1300)
+    .attr("width", 650)
     .attr("height", 600);
 
   svg.style("border", "1px solid black");
 
   const data_model = new CSModel(data);
 
-  const CI = new ChatInterface(data_model, svg, session_info);
-  const CDI = new CodeDisplayInterface(data_model, svg, session_info);
+  const CI = new ChatInterface(data_model, svg, session_info, model, el);
 
   data_model.add_view(CI);
-  data_model.add_view(CDI);
 
   model.on("change:_vis_data", () => {
     const updated = model.get("_vis_data");

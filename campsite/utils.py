@@ -24,7 +24,7 @@ def validate_and_clean_dataframe(in_cpy, supress_warnings=False):
     original_cols = in_cpy.columns
     o_df = in_cpy.dropna(axis=1, how='all')
 
-    error_report = {}
+    report = {}
 
 
     #remove columns with only nans
@@ -39,38 +39,48 @@ def validate_and_clean_dataframe(in_cpy, supress_warnings=False):
                 print("Warning: The following columns were dropped because they contained entirely 'na' values which guidepost does not support:[{}]".format(rmvd_cols))
         original_cols = o_df.columns
 
-    # drop rows where nans are present
-    row_count = o_df.shape[0]
-    o_df = o_df.dropna()
-    row_diff = row_count-o_df.shape[0]
-    if(row_diff>0):
-        rmvd_cols = ', '.join(col_diff)
-        report = {"na_rows_dropped": row_diff}
-        if(not supress_warnings):
+    # Report NaN presence but do NOT drop rows
+    na_counts = o_df.isna().sum()
+    cols_with_na = na_counts[na_counts > 0]
+    if len(cols_with_na) > 0:
+        report["na_column_counts"] = {col: int(count) for col, count in cols_with_na.items()}
+        if not supress_warnings:
+            na_summary = ', '.join(f"{col}({count})" for col, count in cols_with_na.items())
             if warn_supported_version:
-                warnings.warn("Some rows were dropped because at least one column contained 'na' values which guidepost does not support.", skip_file_prefixes=_warn_skips)
+                warnings.warn(
+                    f"The following columns contain missing values (count per column): [{na_summary}].",
+                    skip_file_prefixes=_warn_skips,
+                )
             else:
-                print("Warning: Some rows were dropped because at least one column contained 'na' values which guidepost does not support.")
-        original_cols = o_df.columns
+                print(f"Note: The following columns contain missing values (count per column): [{na_summary}].")
 
-    #drop columns which are timedelta type
-    o_df = o_df.select_dtypes(exclude=['timedelta64[ns]'])
-    col_diff = original_cols.difference(o_df.columns)
-    if(len(col_diff)>0):
-        rmvd_cols = ', '.join(col_diff)
-        report = {"timedelta_columns": col_diff}
-
-        if(not supress_warnings):
+    # Convert timedelta/duration columns to total seconds (float64)
+    td_cols = [
+        col for col in o_df.columns
+        if pd.api.types.is_timedelta64_dtype(o_df[col])
+        or str(o_df[col].dtype).startswith("duration")
+    ]
+    if td_cols:
+        for col in td_cols:
+            o_df[col] = o_df[col].dt.total_seconds().astype("float64")
+        report["timedelta_converted"] = td_cols
+        converted_cols = ', '.join(td_cols)
+        if not supress_warnings:
             if warn_supported_version:
-                warnings.warn("The following columns were dropped because they contained 'timedelta' values which guidepost does not support:[{}]. Consider converting these to an interger representation.".format(rmvd_cols), skip_file_prefixes=_warn_skips)
+                warnings.warn(
+                    f"The following timedelta/duration columns were converted to total seconds (float): [{converted_cols}].",
+                    skip_file_prefixes=_warn_skips,
+                )
             else:
-                print("Warning: The following columns were dropped because they contained 'timedelta' values which guidepost does not support:[{}]. Consider converting these to an interger representation.".format(rmvd_cols))
-        original_cols = o_df.columns
+                print(f"Note: The following timedelta/duration columns were converted to total seconds (float): [{converted_cols}].")
 
     #drop arrays/complex datatypes
     col_diff = []
     for col in o_df.columns:
-        if(type(o_df[col].iloc[0]) == type(np.ndarray([]))):
+        dtype_str = str(o_df[col].dtype)
+        is_arrow_list = "list<" in dtype_str
+        is_numpy_array = len(o_df) > 0 and type(o_df[col].iloc[0]) == type(np.ndarray([]))
+        if is_arrow_list or is_numpy_array:
             col_diff.append(col)
             o_df = o_df.drop(col, axis=1)
 
@@ -95,6 +105,15 @@ def validate_and_clean_dataframe(in_cpy, supress_warnings=False):
                 print("Warning: Your dataframe is very large. You may experience performance issues. Consider subsampling or reducing the data down to below 200,000 rows to enhance performance.")
 
     return o_df, report
+
+def _safe_float(val):
+    """Convert a value to float, returning None for NA/NaT/NaN/Inf types."""
+    if pd.isna(val):
+        return None
+    result = float(val)
+    if not np.isfinite(result):
+        return None
+    return result
 
 def extract_summary_statistics(o_df):
         summary = {}
@@ -147,15 +166,15 @@ def extract_summary_statistics(o_df):
                 ser = pd.to_numeric(s, errors="coerce")
                 col_summary.update({
                     "count": int(ser.count()),
-                    "mean": None if ser.count() == 0 else float(ser.mean()),
-                    "std": None if ser.count() == 0 else float(ser.std()),
-                    "min": None if ser.count() == 0 else float(ser.min()),
-                    "25%": None if ser.count() == 0 else float(ser.quantile(0.25)),
-                    "50%": None if ser.count() == 0 else float(ser.quantile(0.5)),
-                    "75%": None if ser.count() == 0 else float(ser.quantile(0.75)),
-                    "IQR": None if ser.count() == 0 else float(ser.quantile(0.75) - ser.quantile(0.25)),
-                    "max": None if ser.count() == 0 else float(ser.max()),
-                    "var": None if ser.count() == 0 else float(ser.var())
+                    "mean": _safe_float(ser.mean()),
+                    "std": _safe_float(ser.std()),
+                    "min": _safe_float(ser.min()),
+                    "25%": _safe_float(ser.quantile(0.25)),
+                    "50%": _safe_float(ser.quantile(0.5)),
+                    "75%": _safe_float(ser.quantile(0.75)),
+                    "IQR": _safe_float(ser.quantile(0.75) - ser.quantile(0.25)),
+                    "max": _safe_float(ser.max()),
+                    "var": _safe_float(ser.var())
                 })
             else:
                 # categorical / ordinal: top categories and frequencies

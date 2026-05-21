@@ -30,6 +30,7 @@ setup(
         'flask-cors>=3.0',
         'langgraph>=0.0.20',
         'langchain-openai>=0.0.5',
+        'langchain-anthropic>=0.3',
         'lark>=1.1',
         'pydantic>=2.0',
         'requests>=2.25',

@@ -229,7 +229,7 @@ class Campsite(anywidget.AnyWidget):
         )
         self.response = response.text
 
-    def direct_analyze(self, question: str) -> dict:
+    def direct_analyze(self, question: str, hypothesis_only: bool = False) -> dict:
         """
         Run direct analysis: hypothesis translation → artifact generation.
 
@@ -238,9 +238,11 @@ class Campsite(anywidget.AnyWidget):
 
         Args:
             question: Research question to analyze
+            hypothesis_only: If True, only generate the hypothesis and skip
+                artifact generation (no vega_lite_spec, code, or explanation).
 
         Returns:
-            dict: Response with hypothesis, vega_lite_spec, code, explanation
+            dict: Response with hypothesis (and optionally vega_lite_spec, code, explanation)
         """
         import requests
 
@@ -249,12 +251,19 @@ class Campsite(anywidget.AnyWidget):
             json={
                 "question": question,
                 "dataSummary": dict(self._summary_stats),
+                "hypothesisOnly": hypothesis_only,
             },
         )
         result = response.json()
 
         if "error" in result:
             print(f"Error: {result['error']}")
+        else:
+            print(f"\n--- Hypothesis ---\n{result['hypothesis']}")
+            if not hypothesis_only:
+                print(f"\n--- Vega-Lite Spec ---\n{json.dumps(result['vega_lite_spec'], indent=2)}")
+                print(f"\n--- Generated Code ---\n{result['code']}")
+                print(f"\n--- Explanation ---\n{result['explanation']}")
 
         return result
 
@@ -294,38 +303,113 @@ class Campsite(anywidget.AnyWidget):
 
         return result
 
-    def extract_nl_invariants(self, hypotheses_df, output_dir="."):
+    def check_pipeline(self, hypothesis: str) -> dict:
+        """
+        Run the full translation pipeline on an NL hypothesis and return failures.
+
+        Takes a natural language hypothesis, translates it to a formal IR,
+        generates a visualization artifact, and runs NL->IR and IR->VIS
+        semantic invariant checks on the produced artifacts.
+
+        Requires data to be loaded first via load_data() or the records setter.
+
+        Args:
+            hypothesis: Natural language hypothesis to evaluate
+
+        Returns:
+            dict with keys:
+                ir: dict — the parsed IR AST
+                code: str — generated Python visualization code
+                vega_lite_spec: dict — the vega-lite specification
+                failures: list[dict] — all semantic invariant violations,
+                    each with invariantID, violationType, message,
+                    criticality, expected, observed
+        """
+        import requests
+        from .campsite_lib.ir_parser import parse_hypothesis, hypothesis_to_dict
+        from .campsite_lib.nl_extractors import NLExtractor
+        from .campsite_lib.si_checkers import SICheckRunner
+
+        # Step 1: Translate NL → formal hypothesis → visualization artifact
+        response = requests.post(
+            url=f"http://localhost:{self._server.port}/direct_analyze",
+            json={
+                "question": hypothesis,
+                "dataSummary": dict(self._summary_stats),
+                "hypothesisOnly": False,
+            },
+        )
+        result = response.json()
+
+        if "error" in result:
+            raise RuntimeError(f"Pipeline failed: {result['error']}")
+
+        formal_hypothesis = result["hypothesis"]
+        vega_spec = result.get("vega_lite_spec")
+        code = result.get("code", "")
+
+        # Step 2: Parse the formal hypothesis into IR
+        parse_result = parse_hypothesis(formal_hypothesis)
+        ir_dict = hypothesis_to_dict(parse_result.hypothesis)
+
+        # Collect parse errors as failures
+        failures = [
+            {
+                "invariantID": "ir.parse",
+                "violationType": "malformed",
+                "message": f"IR parse error in {e.get('boundary', 'unknown')}: {e.get('message', '')}",
+                "criticality": "fail",
+                "expected": None,
+                "observed": e.get("text", ""),
+            }
+            for e in (hypothesis_to_dict(err) for err in parse_result.errors)
+        ]
+
+        # Step 3: Extract NL canonical field values from the original hypothesis
+        nl_extractor = NLExtractor()
+        nl_values = nl_extractor.extract_all(hypothesis)
+
+        # Step 4: Run NL->IR and IR->VIS semantic invariant checks
+        runner = SICheckRunner()
+        violations = runner.run_all(
+            ir=ir_dict,
+            nl_values=nl_values,
+            artifact=vega_spec,
+        )
+
+        failures.extend(v.to_dict() for v in violations)
+
+        return {
+            "ir": ir_dict,
+            "code": code,
+            "vega_lite_spec": vega_spec,
+            "failures": failures,
+        }
+
+    def extract_nl_invariants(self, hypotheses_df, output_dir=".", include_rationale=True):
         import csv
+        import json
         import os
         from .campsite_lib.nl_extractors import NLExtractor
 
-        CANONICAL_FIELDS = [
-            "event.comparator", "event.referent",
-            "event.quantity.signature", "event.quantity.conditioning",
-            "event.quantity.shape", "event.quantity.uncertainty", "event.form",
-            "event.referent.quantity.signature",
-            "event.referent.quantity.conditioning",
-            "event.referent.quantity.shape",
-            "event.referent.quantity.uncertainty",
+        COLUMNS = [
+            "hypothesis_id", "hypothesis_text",
+            "comparator",
+            "ref.type", "ref.value",
+            "qty.signature", "qty.shape", "qty.uncertainty",
+            "cond.n", "conditions",
+            "scope",
+            "partition.structure", "partition.ordered",
+            "frame",
         ]
 
-        meta_headers = ["hypothesis_id"]
-        for field in CANONICAL_FIELDS:
-            meta_headers += [f"{field}.value", f"{field}.confidence", f"{field}.rationale"]
-
         values_path = os.path.join(output_dir, "nl_values.csv")
-        metadata_path = os.path.join(output_dir, "nl_metadata.csv")
-
-        nl_extractor = NLExtractor()
+        nl_extractor = NLExtractor(include_rationale=include_rationale)
         all_results = []
 
-        with open(values_path, "w", newline="") as vf, \
-             open(metadata_path, "w", newline="") as mf:
+        with open(values_path, "w", newline="") as vf:
             val_writer = csv.writer(vf)
-            meta_writer = csv.writer(mf)
-
-            val_writer.writerow(["hypothesis_id"] + CANONICAL_FIELDS)
-            meta_writer.writerow(meta_headers)
+            val_writer.writerow(COLUMNS)
 
             for _, row in hypotheses_df.iterrows():
                 hyp_id = row["hypothesis_id"]
@@ -333,22 +417,58 @@ class Campsite(anywidget.AnyWidget):
                 nl_values = nl_extractor.extract_all(nl)
                 all_results.append((hyp_id, nl_values))
 
-                val_row = [hyp_id]
-                for field in CANONICAL_FIELDS:
-                    ev = nl_values.get(field)
-                    val_row.append(str(ev.value) if ev and ev.exists else "")
-                val_writer.writerow(val_row)
-                vf.flush()
+                # Comparator (raw operator symbol)
+                cmp_ev = nl_values.get("comparator")
+                comparator = str(cmp_ev.value) if cmp_ev and cmp_ev.exists else "ᚦ"
 
-                meta_row = [hyp_id]
-                for field in CANONICAL_FIELDS:
-                    ev = nl_values.get(field)
-                    if ev and ev.exists:
-                        meta_row += [str(ev.value), str(ev.confidence), ev.metadata.get("rationale", "")]
-                    else:
-                        meta_row += ["", "", ""]
-                meta_writer.writerow(meta_row)
-                mf.flush()
+                # Referent sub-fields
+                ref_ev = nl_values.get("referent")
+                ref = ref_ev.value if ref_ev and ref_ev.exists and isinstance(ref_ev.value, dict) else {}
+                ref_type = ref.get("type", "")
+                ref_value = ref.get("value", "")
+
+                # Quantity fields
+                sig_ev = nl_values.get("quantity.signature")
+                qty_signature = str(sig_ev.value) if sig_ev and sig_ev.exists else ""
+                shp_ev = nl_values.get("quantity.shape")
+                qty_shape = str(shp_ev.value) if shp_ev and shp_ev.exists else ""
+                unc_ev = nl_values.get("quantity.uncertainty")
+                qty_uncertainty = str(unc_ev.value) if unc_ev and unc_ev.exists else ""
+
+                # Conditions
+                cond_ev = nl_values.get("conditions")
+                if cond_ev and cond_ev.exists and isinstance(cond_ev.value, list):
+                    cond_n = len(cond_ev.value)
+                    conditions = json.dumps(cond_ev.value)
+                else:
+                    cond_n = 0
+                    conditions = "[]"
+
+                # Scope
+                scope_ev = nl_values.get("scope")
+                scope = str(scope_ev.value) if scope_ev and scope_ev.exists else ""
+
+                # Partition sub-fields
+                part_ev = nl_values.get("partition")
+                part = part_ev.value if part_ev and part_ev.exists and isinstance(part_ev.value, dict) else {}
+                part_structure = part.get("structure", "")
+                part_ordered = part.get("ordered", "")
+
+                # Frame
+                frame_ev = nl_values.get("frame")
+                frame = str(frame_ev.value) if frame_ev and frame_ev.exists else ""
+
+                val_writer.writerow([
+                    hyp_id, nl,
+                    comparator,
+                    ref_type, ref_value,
+                    qty_signature, qty_shape, qty_uncertainty,
+                    cond_n, conditions,
+                    scope,
+                    part_structure, part_ordered,
+                    frame,
+                ])
+                vf.flush()
 
         return all_results
 

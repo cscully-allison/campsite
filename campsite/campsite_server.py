@@ -158,9 +158,10 @@ def create_app() -> Flask:
         data = request.get_json()
         question = data.get("question", "")
         data_summary = data.get("dataSummary", {})
+        hypothesis_only = data.get("hypothesisOnly", False)
 
         try:
-            result_state = run_async(direct_analysis(question, data_summary))
+            result_state = run_async(direct_analysis(question, data_summary, hypothesis_only=hypothesis_only))
             vega_spec = (
                 json.loads(result_state.vega_lite_spec)
                 if result_state.vega_lite_spec

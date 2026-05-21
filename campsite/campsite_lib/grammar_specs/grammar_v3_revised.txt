@@ -1,0 +1,232 @@
+############################################
+# Hypothesis spine (all versions)
+############################################
+
+hypothesis   :- event
+              | event WITHIN partition
+              | event ACROSS partition
+              | event ACROSS partition WITHIN partition
+
+event        :- quantity comparator referent
+              | quantity ᚦ referent
+              | quantity comparator ᚦ
+
+referent     :- const | func(var (, var)*)
+
+comparator   :- > | < | = | >= | <= | != | BETWEEN | IN
+
+
+############################################
+# Partition and condition logic (V1)
+############################################
+
+partition    :- attr (partition-pred)?
+              | partition X partition
+
+partition-pred :- comparator pred-ref
+
+
+############################################
+# Quantity of interest (V3 = maximal)
+############################################
+
+quantity     :- rv
+              | estimand
+              | expr
+
+
+############################################
+# Explicit uncertainty (V3 addition)
+############################################
+
+rv           :- Distribution(estimand)
+              | Distribution(expr)
+
+
+############################################
+# Explicit estimands (V2 addition)
+############################################
+
+estimand     :- expectation
+              | contrast
+
+expectation  :- E[expr]
+
+contrast     :- expectation fop expectation
+
+
+############################################
+# Symbolic expressions (V1 baseline)
+############################################
+
+expr         :- (subject) (predicate)?
+
+subject      :- var
+              | func(expr (, expr)*)
+              | expr fop expr
+              | extract
+
+var          :- attr
+              | const
+
+func         :- AVG | MAX | MIN | SUM | COUNT
+              | MEDIAN | VARIANCE | STDDEV
+              | CORR | PERCENTILE | QUANTILE | …
+
+fop          :- + | - | * | /
+
+
+############################################
+# Predicates (V1 — row-level conditions)
+############################################
+
+predicate    :- attr comparator pred-ref (LOP predicate)*
+
+pred-ref     :- const | extract | pred-expr
+
+pred-expr    :- var
+              | func(pred-expr (, pred-expr)*)
+              | pred-expr fop pred-expr
+              | extract
+
+LOP          :- ^ | v
+
+
+############################################
+# Constants and attributes
+############################################
+
+attr         :- string
+const        :- number | string | (number, number) | boolean
+
+
+############################################
+# Model-related quantities (semantic but non-core)
+############################################
+
+extract      :- Extract(model, expr)
+model        :- predictive_model
+
+
+############################################
+# Element descriptions
+############################################
+#
+# hypothesis    — A top-level testable claim. In its simplest form, a single
+#                 event. May be distributed ACROSS a partition (omnibus: one
+#                 quantity per group, implicit test of whether quantities
+#                 differ across groups) or repeated WITHIN a partition
+#                 (stratification: same hypothesis tested independently in
+#                 each stratum). ACROSS and WITHIN may compose: the event
+#                 is distributed across groups within each stratum.
+#
+# event         — A statement comparing a quantity against a referent using
+#                 a comparator. The comparator or referent may be left
+#                 intentionally unspecified (ᚦ) to express partial or
+#                 exploratory hypotheses.
+#
+# quantity      — The measurable value of interest. Can be a random variable
+#                 (V3), a formal statistical estimand (V2), or a symbolic
+#                 expression (V1).
+#
+# referent      — The value a quantity is compared against. Can be a
+#                 constant or a function of data attributes.
+#
+# comparator    — A relational operator (>, <, =, >=, <=, !=, BETWEEN, IN)
+#                 used to compare a quantity to a referent.
+#
+# ᚦ             — A placeholder for an intentionally unspecified component,
+#                 allowing partial or exploratory hypotheses.
+#
+# partition     — One or more attributes that define how data is split into
+#                 groups. A single attr produces one group per unique value.
+#                 The X (cross) operator produces the Cartesian product of
+#                 two partitions' levels. A partition may carry an optional
+#                 partition-pred to restrict which groups are included (e.g.,
+#                 only the top and bottom quartiles). Hierarchical grouping
+#                 (B meaningful only within A) is expressed by using WITHIN
+#                 at the hypothesis level, not by a partition operator.
+#
+# partition-pred — A condition on a partition attribute that restricts which
+#                 levels of the partition participate. Unlike a predicate
+#                 (which filters rows), a partition-pred filters groups.
+#                 Uses the same comparator and pred-ref as predicates.
+#
+# ACROSS        — Keyword indicating that the partition defines the
+#                 comparison dimension. The quantity is computed once per
+#                 group, producing an omnibus test. Observable in NL as
+#                 "by X", "across X", "for each X". In visualization as
+#                 a categorical axis, color encoding, or grouped bars.
+#
+# WITHIN        — Keyword indicating that the partition defines strata in
+#                 which the hypothesis is independently repeated. Observable
+#                 in NL as "within each X", "separately for each X",
+#                 "controlling for X". In visualization as faceted panels
+#                 repeating the same chart structure.
+#
+# X             — Cross operator on partitions. Produces the Cartesian
+#                 product of the levels of two partitions. Observable in NL
+#                 as "by A and B" where both are grouping variables. In
+#                 visualization as a two-dimensional grouping (e.g., color
+#                 within axis categories).
+#
+# rv            — A random variable or distribution over an estimand.
+#                 Represents uncertainty about the estimand rather than a
+#                 point estimate.
+#
+# estimand      — A formally defined statistical quantity. Either an
+#                 expectation or a contrast between expectations.
+#
+# expectation   — The expected value of an expression: E[expr].
+#                 Defines a statistic to be compared in a contrast or
+#                 evaluated directly.
+#
+# contrast      — An arithmetic combination of two expectations, such
+#                 as a difference or ratio, used for comparative analyses.
+#                 The two expectations typically carry predicates that
+#                 define the arms of the comparison.
+#
+# expr          — A symbolic mathematical expression built from variables,
+#                 function calls, and arithmetic operators. May carry an
+#                 optional predicate to condition the subject on a data
+#                 subset. A predicate placed here applies to all subject
+#                 expressions as though it were duplicated and '^' with
+#                 each predicate on consituitient expressions.
+#
+# var           — A variable in a symbolic expression. Can refer to a named
+#                 data attribute or a literal constant.
+#
+# func          — A named aggregate or statistical function (e.g., AVG,
+#                 SUM, MEDIAN, CORR) applied to one or more expressions.
+#
+# fop           — A binary arithmetic operator (+, −, ×, ÷) combining two
+#                 expressions or expectations.
+#
+# predicate     — A condition over the data, expressed as an attribute–
+#                 comparator–value triple (V1). Multiple predicates can be
+#                 combined using logical operators (LOP). Predicates denote
+#                 data subsets (events), not boolean values. They filter
+#                 rows for the expression they attach to.
+#
+# pred-ref      — The referent target of a predicate condition. Can be a
+#                 constant, a function expression, or a model extraction.
+#
+# pred-expr     — A symbolic mathematical expression used within predicates.
+#                 Built from variables, function calls, arithmetic
+#                 operators, and model extractions. Cannot itself carry a
+#                 predicate (no recursive conditioning).
+#
+# LOP           — A logical operator that connects predicates: ^
+#                 (conjunction/and) or v (disjunction/or).
+#
+# attr          — A named data attribute (column name), represented as a
+#                 string.
+#
+# const         — A literal value: a number, string, numeric range (tuple),
+#                 or boolean.
+#
+# extract       — An operation that retrieves a quantity from a fitted
+#                 predictive model given an expression.
+#
+# model         — A reference to a fitted predictive model from which
+#                 quantities can be extracted.

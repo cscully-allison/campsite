@@ -16,6 +16,17 @@ class Const:
 ConstValue = Union[int, float, str, tuple[float, float]]
 
 
+# ---------- Wildcard (***) ----------
+@dataclass
+class Wildcard:
+    """Wildcard predicate value (***) — matches any categorical level.
+
+    Retained for backward compatibility; no longer produced by the parser.
+    """
+
+    type: Literal["wildcard"] = "wildcard"
+
+
 # ---------- Unspecified (ᚦ) ----------
 @dataclass
 class Unspecified:
@@ -43,11 +54,11 @@ class Predicate:
     """Predicate for conditional expressions."""
 
     type: Literal["predicate"] = "predicate"
-    kind: Literal["comparison", "conjunction"] = "comparison"
+    kind: Literal["comparison", "conjunction", "disjunction"] = "comparison"
     attr: str = ""
     comparator: str = "="
-    value: ConstValue = 0
-    # For conjunction predicates (kind="conjunction")
+    value: "PredRef" = 0
+    # For compound predicates (kind="conjunction" or "disjunction")
     lhs: Optional["Predicate"] = None
     rhs: Optional["Predicate"] = None
 
@@ -92,17 +103,30 @@ class BinaryExpr:
     rhs: "Expr" = None
 
 
-Expr = Union[AttrVar, ConstVar, FuncCall, BinaryExpr, "Extract", ErrorNode]
+# ---------- Conditioned Expression ----------
+@dataclass
+class ConditionedExpr:
+    """Expression conditioned on a predicate: subject (predicate)."""
+
+    type: Literal["conditioned_expr"] = "conditioned_expr"
+    expr: "Expr" = None
+    predicate: Union[Predicate, ErrorNode] = None
+
+
+Expr = Union[AttrVar, ConstVar, FuncCall, BinaryExpr, "Extract", ConditionedExpr, ErrorNode]
+
+
+# ---------- Predicate value types ----------
+PredRef = Union[ConstValue, "AttrVar", "ConstVar", "FuncCall", "BinaryExpr", "Extract", Wildcard]
 
 
 # ---------- Estimands ----------
 @dataclass
 class Expectation:
-    """Expectation estimand E[attr | predicate]."""
+    """Expectation estimand E[expr]."""
 
     type: Literal["expectation"] = "expectation"
-    attr: str = ""
-    predicate: Union[Predicate, ErrorNode] = None
+    expr: Expr = None
 
 
 @dataclass
@@ -121,27 +145,57 @@ Estimand = Union[Contrast, Expectation, ErrorNode]
 # ---------- Uncertainty ----------
 @dataclass
 class RV:
-    """Random variable wrapping an estimand."""
+    """Random variable wrapping an estimand or expression."""
 
     type: Literal["rv"] = "rv"
     distribution: str = ""
-    estimand: Estimand = None
+    estimand: Union[Estimand, Expr] = None
 
 
 # ---------- Quantities ----------
 Quantity = Union[RV, Estimand, Expr, ErrorNode]
 
 
+# ---------- Partitions ----------
+@dataclass
+class PartitionPred:
+    """Condition on a partition attribute restricting which groups participate."""
+
+    type: Literal["partition_pred"] = "partition_pred"
+    comparator: str = "="
+    value: PredRef = None
+
+
+@dataclass
+class Partition:
+    """Defines how data is split into groups by a single attribute."""
+
+    type: Literal["partition"] = "partition"
+    attr: str = ""
+    pred: Optional[PartitionPred] = None
+
+
+@dataclass
+class CrossPartition:
+    """Cartesian product of two partitions (X operator)."""
+
+    type: Literal["cross_partition"] = "cross_partition"
+    lhs: "PartitionType" = None
+    rhs: "PartitionType" = None
+
+
+PartitionType = Union[Partition, CrossPartition]
+
+
 # ---------- Events ----------
 @dataclass
 class Comparison:
-    """Event: quantity comparator referent (predicate)?"""
+    """Event: quantity comparator referent."""
 
     type: Literal["comparison"] = "comparison"
     quantity: Quantity = None
     comparator: str = "="  # "ᚦ" when intentionally unspecified
-    referent: Union[Const, Quantity, Unspecified, ErrorNode] = None
-    predicate: Optional[Predicate] = None  # optional event-level predicate
+    referent: Union[Const, FuncCall, Unspecified, ErrorNode] = None
 
 
 Event = Union[Comparison, ErrorNode]
@@ -154,16 +208,18 @@ class Hypothesis:
 
     type: Literal["hypothesis"] = "hypothesis"
     event: Event = None
+    across_partition: Optional[PartitionType] = None
+    within_partition: Optional[PartitionType] = None
 
 
 # ---------- Model extraction ----------
 @dataclass
 class Extract:
-    """Model extraction node."""
+    """Model extraction node: Extract(model, expr)."""
 
     type: Literal["extract"] = "extract"
     model: str = ""
-    estimand: Estimand = None
+    expr: Expr = None
 
 
 # ---------- Parse Result ----------
@@ -191,7 +247,7 @@ VALID_COMPARATORS = frozenset(["=", ">", "<", ">=", "<=", "!=", "BETWEEN", "IN",
 FUNC_NAMES = frozenset([
     "AVG", "MAX", "MIN", "SUM", "COUNT",
     "MEDIAN", "VARIANCE", "STDDEV",
-    "CORR", "PERCENTILE"
+    "CORR", "PERCENTILE", "QUANTILE"
 ])
 
 # Field operators

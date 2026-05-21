@@ -5,7 +5,7 @@ from langgraph.graph import StateGraph, END, START
 
 from .utils import AnalysisState, llm, log
 # from .hypothesis_node import hypothesis_node
-from .hypothesis_translators import v3_grammar_node as hypothesis_node
+from .hypothesis_translators import no_grammar_node as hypothesis_node
 from .artifact_gen import generate_artifact
 
 
@@ -284,12 +284,22 @@ def create_analysis_graph() -> StateGraph:
     return graph.compile()
 
 
-async def direct_analysis(question: str, data_summary: dict) -> AnalysisState:
-    """Run hypothesis translation and artifact generation without clarification.
+async def direct_analysis(
+    question: str,
+    data_summary: dict,
+    hypothesis_only: bool = False,
+) -> AnalysisState:
+    """Run hypothesis translation and optionally artifact generation.
 
     Bypasses the conversation manager entirely — takes a research question
-    straight through hypothesis_node → artifact_gen_node and returns the
-    completed state.
+    straight through hypothesis_node (and optionally artifact_gen_node) and
+    returns the completed state.
+
+    Args:
+        question: Research question to analyze.
+        data_summary: Dataset summary statistics.
+        hypothesis_only: If True, skip artifact generation and return after
+            hypothesis translation.
     """
     state = AnalysisState(
         initialUserQuestion=question,
@@ -298,7 +308,9 @@ async def direct_analysis(question: str, data_summary: dict) -> AnalysisState:
     )
 
     state = await hypothesis_node(state)
-    state = await artifact_gen_node(state)
+
+    if not hypothesis_only:
+        state = await artifact_gen_node(state)
 
     return state
 

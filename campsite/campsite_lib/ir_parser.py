@@ -16,65 +16,111 @@ from .ir_ast import (
     ConstVar,
     BinaryExpr,
     FuncCall,
+    ConditionedExpr,
     Extract,
+    Partition,
+    PartitionPred,
+    CrossPartition,
     ErrorNode,
     ParseResult,
     VALID_COMPARATORS,
 )
 
-# Lark grammar based on grammar.txt specification
-# Note: Using %import common.WS and %ignore to handle whitespace
+# Lark grammar based on grammar_v3_revised.txt specification
 GRAMMAR = r"""
-    start: event
+    ?start: hypothesis
 
-    // Event: quantity comparator referent (predicate)?
-    //      | quantity ᚦ referent
-    //      | quantity comparator ᚦ
-    event: quantity comparator_or_error referent predicate_clause? -> event_node
+    // Hypothesis: event with optional ACROSS/WITHIN partition clauses
+    hypothesis: event "ACROSS" partition "WITHIN" partition -> hyp_across_within
+              | event "ACROSS" partition -> hyp_across
+              | event "WITHIN" partition -> hyp_within
+              | event -> hyp_plain
+
+    // Partition: attr with optional pred, or cross product via X operator
+    // Chain pattern avoids left recursion: partition_atom ("X" partition_atom)*
+    partition: partition_atom ("X" partition_atom)* -> partition_chain
+
+    partition_atom: IDENTIFIER partition_pred? -> partition_node
+
+    partition_pred: comparator_or_error pred_ref -> partition_pred_node
+
+    // Event: quantity comparator referent (no event-level predicate)
+    event: quantity comparator_or_error referent -> event_node
          | quantity THORN referent -> event_unspecified_comparator
          | quantity comparator_or_error THORN -> event_unspecified_referent
 
-    // Referent: const or quantity
+    // Referent: const or func(var, ...)
     referent: const_val -> referent_const
-            | quantity -> referent_quantity
+            | FUNC_NAME "(" var_list ")" -> referent_func
+            | IDENTIFIER "(" var_list ")" -> referent_func
 
-    // Optional event-level predicate in literal parens
-    predicate_clause: "(" predicate ")"
+    var_list: var ("," var)* -> var_list_node
 
-    // Quantity of interest
-    quantity: rv
-            | estimand
-            | expr
+    // Quantity of interest (V3 = maximal)
+    ?quantity: rv
+             | estimand
+             | expr
 
-    // Random variable with distribution
-    rv: IDENTIFIER "(" estimand ")" -> rv_node
+    // Random variable: Distribution(estimand) or Distribution(expr)
+    rv: IDENTIFIER "(" estimand ")" -> rv_estimand_node
+      | IDENTIFIER "(" expr ")" -> rv_expr_node
 
     // Estimands
-    estimand: contrast
-            | expectation
+    ?estimand: contrast
+             | expectation
 
-    expectation: "E" "[" IDENTIFIER "|" predicate "]" -> expectation_node
+    // Expectation: E[expr] — no pipe separator
+    expectation: "E" "[" expr "]" -> expectation_node
 
+    // Contrast: expectation fop expectation
     contrast: expectation fop expectation -> contrast_node
 
-    // Predicates with conjunction support (^ operator)
-    predicate: predicate_atom ("^" predicate_atom)* -> predicate_conjunction
+    // Predicates with conjunction/disjunction support (^ and v operators)
+    predicate: predicate_atom (LOP predicate_atom)* -> predicate_compound
+    LOP: "^" | "v"
 
-    predicate_atom: IDENTIFIER comparator_or_error const_value -> predicate_comparison
+    predicate_atom: IDENTIFIER comparator_or_error pred_ref -> predicate_comparison
 
-    // Expressions
-    expr: extract
-        | binary_expr
-        | func_call
-        | var
+    // pred-ref: const | extract | pred-expr (no wildcard)
+    ?pred_ref: pred_expr
 
-    // Model extraction: Extract(model, estimand)
-    extract: "Extract" "(" IDENTIFIER "," estimand ")" -> extract_node
+    // pred-expr: chain pattern to avoid left recursion
+    pred_expr: pred_atom (fop pred_atom)* -> pred_expr_chain
 
-    binary_expr: var fop expr -> binary_node
+    pred_atom: extract
+             | FUNC_NAME "(" pred_expr_list? ")" -> pred_func_node
+             | IDENTIFIER "(" pred_expr_list? ")" -> pred_func_node
+             | const_value
+             | IDENTIFIER -> pred_attr_var
 
-    func_call: FUNC_NAME "(" expr_list? ")" -> func_node
-             | IDENTIFIER "(" expr_list? ")" -> func_node
+    pred_expr_list: pred_expr ("," pred_expr)* -> pred_expr_list_node
+
+    // Expressions: chain of expr_atoms connected by fop operators
+    // This allows binary ops between conditioned expressions:
+    // salary (dept = "eng") - salary (dept = "sci")
+    expr: expr_atom (fop expr_atom)* -> expr_chain
+
+    // Expression atoms: subject with optional parenthesized predicate
+    expr_atom: subject_chain predicate_clause -> conditioned_expr
+             | subject_chain -> plain_expr
+
+    // Predicate clause: predicate wrapped in literal parentheses
+    predicate_clause: "(" predicate ")"
+
+    // Subject: chain pattern for binary expressions within atoms
+    subject_chain: subject_atom (fop subject_atom)* -> subject_chain_node
+
+    // Subject atoms, including optional grouping parentheses
+    // paren_group wraps expr (not just subject_chain) so conditioned
+    // sub-expressions like (salary (dept = "eng")) work inside parens
+    ?subject_atom: "(" expr ")" -> paren_group
+                 | extract
+                 | FUNC_NAME "(" expr_list? ")" -> func_node
+                 | IDENTIFIER "(" expr_list? ")" -> func_node
+                 | var
+
+    // Model extraction: Extract(model, expr)
+    extract.2: "Extract" "(" IDENTIFIER "," expr ")" -> extract_node
 
     expr_list: expr ("," expr)* -> expr_list_node
 
@@ -95,15 +141,15 @@ GRAMMAR = r"""
 
     COMPARATOR: ">=" | "<=" | "!=" | ">" | "<" | "=" | "BETWEEN" | "IN"
 
-    THORN: "ᚦ"
+    THORN: "\u16A6"
 
     fop: FOP
     FOP: "+" | "-" | "*" | "/"
 
     // Standard aggregate/statistical functions
-    FUNC_NAME: "AVG" | "MAX" | "MIN" | "SUM" | "COUNT"
-             | "MEDIAN" | "VARIANCE" | "STDDEV"
-             | "CORR" | "PERCENTILE"
+    FUNC_NAME.2: "AVG" | "MAX" | "MIN" | "SUM" | "COUNT"
+               | "MEDIAN" | "VARIANCE" | "STDDEV"
+               | "CORR" | "PERCENTILE" | "QUANTILE"
 
     IDENTIFIER: /[a-zA-Z_][a-zA-Z0-9_]*/
     NUMBER: /[0-9]+(\.[0-9]+)?/
@@ -118,18 +164,52 @@ GRAMMAR = r"""
 class HypothesisTransformer(Transformer):
     """Transform Lark parse tree to AST dataclasses."""
 
-    def start(self, event):
+    # -- Hypothesis level --
+
+    def hyp_plain(self, event):
         return Hypothesis(type="hypothesis", event=event)
 
-    def event_node(self, quantity, comparator, referent, *rest):
-        """Event: quantity comparator referent (predicate)?"""
-        predicate = rest[0] if rest else None
+    def hyp_across(self, event, partition):
+        return Hypothesis(type="hypothesis", event=event, across_partition=partition)
+
+    def hyp_within(self, event, partition):
+        return Hypothesis(type="hypothesis", event=event, within_partition=partition)
+
+    def hyp_across_within(self, event, across_part, within_part):
+        return Hypothesis(
+            type="hypothesis",
+            event=event,
+            across_partition=across_part,
+            within_partition=within_part,
+        )
+
+    # -- Partitions --
+
+    def partition_chain(self, *items):
+        """Left-fold [partition_atom, partition_atom, ...] into nested CrossPartition."""
+        if len(items) == 1:
+            return items[0]
+        result = items[0]
+        for i in range(1, len(items)):
+            result = CrossPartition(type="cross_partition", lhs=result, rhs=items[i])
+        return result
+
+    def partition_node(self, attr, *rest):
+        pred = rest[0] if rest else None
+        return Partition(type="partition", attr=str(attr), pred=pred)
+
+    def partition_pred_node(self, comparator, value):
+        return PartitionPred(type="partition_pred", comparator=comparator, value=value)
+
+    # -- Events --
+
+    def event_node(self, quantity, comparator, referent):
+        """Event: quantity comparator referent."""
         return Comparison(
             type="comparison",
             quantity=quantity,
             comparator=comparator,
             referent=referent,
-            predicate=predicate,
         )
 
     def event_unspecified_comparator(self, quantity, _thorn, referent):
@@ -150,46 +230,99 @@ class HypothesisTransformer(Transformer):
             referent=Unspecified(),
         )
 
+    # -- Referents --
+
     def referent_const(self, val):
         return val
 
-    def referent_quantity(self, qty):
-        return qty
+    def referent_func(self, name, var_list):
+        return FuncCall(type="func", name=str(name), args=var_list)
 
-    def predicate_clause(self, predicate):
-        return predicate
+    def var_list_node(self, *vars):
+        return list(vars)
 
-    # Pass-through rules for intermediate non-terminals
+    # -- Quantity pass-through --
+
     def quantity(self, item):
         return item
 
     def estimand(self, item):
         return item
 
-    def expr(self, item):
+    # -- Expressions --
+
+    def expr_chain(self, *items):
+        """Left-fold [expr_atom, op, expr_atom, ...] into nested BinaryExpr."""
+        if len(items) == 1:
+            return items[0]
+        result = items[0]
+        for i in range(1, len(items), 2):
+            result = BinaryExpr(
+                type="binary", lhs=result, op=str(items[i]), rhs=items[i + 1]
+            )
+        return result
+
+    def conditioned_expr(self, subject, predicate):
+        return ConditionedExpr(
+            type="conditioned_expr", expr=subject, predicate=predicate
+        )
+
+    def plain_expr(self, item):
         return item
 
-    def rv_node(self, dist, estimand):
+    def predicate_clause(self, predicate):
+        return predicate
+
+    def subject_chain_node(self, *items):
+        """Left-fold [atom, op, atom, ...] into nested BinaryExpr."""
+        if len(items) == 1:
+            return items[0]
+        result = items[0]
+        for i in range(1, len(items), 2):
+            result = BinaryExpr(
+                type="binary", lhs=result, op=str(items[i]), rhs=items[i + 1]
+            )
+        return result
+
+    def paren_group(self, inner):
+        """Pass-through for optional grouping parentheses around subject."""
+        return inner
+
+    def subject_atom(self, item):
+        return item
+
+    # -- RV --
+
+    def rv_estimand_node(self, dist, estimand):
         return RV(type="rv", distribution=str(dist), estimand=estimand)
 
-    def expectation_node(self, attr, predicate):
-        return Expectation(type="expectation", attr=str(attr), predicate=predicate)
+    def rv_expr_node(self, dist, expr):
+        return RV(type="rv", distribution=str(dist), estimand=expr)
+
+    # -- Estimands --
+
+    def expectation_node(self, expr):
+        return Expectation(type="expectation", expr=expr)
 
     def contrast_node(self, left, op, right):
         return Contrast(type="contrast", lhs=left, op=str(op), rhs=right)
 
-    def predicate_conjunction(self, *predicates):
-        """Handle predicate conjunction with ^ operator."""
-        if len(predicates) == 1:
-            return predicates[0]
-        # Build left-associative conjunction tree
-        result = predicates[0]
-        for pred in predicates[1:]:
+    # -- Predicates --
+
+    def predicate_compound(self, *items):
+        """Handle predicate with ^ (conjunction) and v (disjunction) operators."""
+        if len(items) == 1:
+            return items[0]
+        # items = [pred, lop, pred, lop, pred, ...]
+        result = items[0]
+        for i in range(1, len(items), 2):
+            op = str(items[i])
+            kind = "conjunction" if op == "^" else "disjunction"
             result = Predicate(
                 type="predicate",
-                kind="conjunction",
+                kind=kind,
                 lhs=result,
-                rhs=pred,
+                rhs=items[i + 1],
             )
         return result
 
@@ -202,16 +335,42 @@ class HypothesisTransformer(Transformer):
             value=value,
         )
 
-    def extract_node(self, model, estimand):
-        """Handle Extract(model, estimand) expressions."""
+    def pred_ref(self, item):
+        return item
+
+    def pred_atom(self, item):
+        return item
+
+    def pred_attr_var(self, name):
+        return AttrVar(type="attr", name=str(name))
+
+    def pred_expr_chain(self, *items):
+        """Left-fold [atom, op, atom, ...] into nested BinaryExpr."""
+        if len(items) == 1:
+            return items[0]
+        result = items[0]
+        for i in range(1, len(items), 2):
+            result = BinaryExpr(type="binary", lhs=result, op=str(items[i]), rhs=items[i + 1])
+        return result
+
+    def pred_func_node(self, name, *args):
+        arg_list = args[0] if args else []
+        return FuncCall(type="func", name=str(name), args=arg_list)
+
+    def pred_expr_list_node(self, *exprs):
+        return list(exprs)
+
+    # -- Extract --
+
+    def extract_node(self, model, expr):
+        """Handle Extract(model, expr) expressions."""
         return Extract(
             type="extract",
             model=str(model),
-            estimand=estimand,
+            expr=expr,
         )
 
-    def binary_node(self, left, op, right):
-        return BinaryExpr(type="binary", lhs=left, op=str(op), rhs=right)
+    # -- Function calls and expressions --
 
     def func_node(self, name, *args):
         arg_list = args[0] if args else []
@@ -219,6 +378,8 @@ class HypothesisTransformer(Transformer):
 
     def expr_list_node(self, *exprs):
         return list(exprs)
+
+    # -- Variables and constants --
 
     def attr_var(self, name):
         return AttrVar(type="attr", name=str(name))
@@ -364,11 +525,10 @@ def _try_parse_segment(text: str, role: str):
     """Try to parse a text segment as a quantity or referent using dummy wrappers.
 
     For quantity: wraps as '{text} > 0' and extracts .event.quantity.
-    For referent: wraps as 'x > {text}' and extracts .event.referent (and .event.predicate).
+    For referent: wraps as 'x > {text}' and extracts .event.referent.
 
     Returns:
-        For quantity: (node, error_or_none)
-        For referent: (referent_node, predicate_or_none, error_or_none)
+        (node, error_or_none)
     """
     parser = get_parser()
     transformer = HypothesisTransformer()
@@ -381,8 +541,6 @@ def _try_parse_segment(text: str, role: str):
             message=f"Empty {role}",
             text=text,
         )
-        if role == "referent":
-            return err, None, err
         return err, err
 
     if role == "quantity":
@@ -405,7 +563,7 @@ def _try_parse_segment(text: str, role: str):
         try:
             tree = parser.parse(wrapper)
             result = transformer.transform(tree)
-            return result.event.referent, result.event.predicate, None
+            return result.event.referent, None
         except Exception as e:
             err = ErrorNode(
                 type="error",
@@ -413,7 +571,7 @@ def _try_parse_segment(text: str, role: str):
                 message=f"Parse error in referent: {_first_line(e)}",
                 text=text_stripped,
             )
-            return err, None, err
+            return err, err
 
     # Unknown role — shouldn't happen
     err = ErrorNode(type="error", boundary="event", message=f"Unknown role: {role}", text=text_stripped)
@@ -463,8 +621,8 @@ def _attempt_recovery(text: str, original_error: Exception) -> ParseResult:
         q_err.end = comp_start
         errors.append(q_err)
 
-    # Parse referent segment (may also recover event-level predicate)
-    referent_node, predicate_node, r_err = _try_parse_segment(rest_text, "referent")
+    # Parse referent segment
+    referent_node, r_err = _try_parse_segment(rest_text, "referent")
     if r_err:
         r_err.start = comp_end
         r_err.end = len(text)
@@ -487,7 +645,6 @@ def _attempt_recovery(text: str, original_error: Exception) -> ParseResult:
         quantity=quantity_node,
         comparator=comp_str,
         referent=referent_node,
-        predicate=predicate_node,
     )
 
     return ParseResult(

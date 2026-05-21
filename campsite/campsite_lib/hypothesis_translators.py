@@ -164,8 +164,7 @@ Rules:
    grammar above. Do not deviate from the grammar's productions.
 2. Use the exact syntax defined in the grammar (e.g., comparators, function
    names, predicate notation).
-3. If an element is intentionally unspecified, use the ᚦ symbol as defined
-   in the grammar.
+3. Do not include "hypothesis :-" in your output
 4. Output ONLY the formal hypothesis expression. No explanation, no
    preamble, no commentary.
 
@@ -197,13 +196,13 @@ Rules:
 # ---------------------------------------------------------------------------
 
 v1_grammar_node: Callable[[AnalysisState], Awaitable[AnalysisState]] = (
-    _make_grammar_node("grammar_v1.txt", "v1")
+    _make_grammar_node("grammar_v1_revised.txt", "v1")
 )
 
 v2_grammar_node: Callable[[AnalysisState], Awaitable[AnalysisState]] = (
-    _make_grammar_node("grammar_v2.txt", "v2")
+    _make_grammar_node("grammar_v2_revised.txt", "v2")
 )
 
 v3_grammar_node: Callable[[AnalysisState], Awaitable[AnalysisState]] = (
-    _make_grammar_node("grammar_v3.txt", "v3")
+    _make_grammar_node("grammar_v3_revised.txt", "v3")
 )

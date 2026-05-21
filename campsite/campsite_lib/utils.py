@@ -1,9 +1,12 @@
 """Utility functions and types for Campsite analysis."""
 
 import os
-from typing import Literal, Optional, Any
+from typing import Literal, Optional, Any, Union
 from pydantic import BaseModel, ConfigDict
 from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
+
+LLMClient = Union[ChatOpenAI, ChatAnthropic]
 
 # Log file path
 LOGFILE = "./log.txt"
@@ -45,26 +48,51 @@ class AnalysisState(BaseModel):
 AnalysisStateType = AnalysisState
 
 
-def get_llm() -> ChatOpenAI:
-    """Get configured LLM instance using environment variable for API key."""
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        raise ValueError(
-            "OPENAI_API_KEY environment variable not set. "
-            "Please set it to use the Campsite analysis features."
+def get_llm() -> LLMClient:
+    """Get configured LLM instance.
+
+    Provider is selected via the LLM_PROVIDER env var ("anthropic" or
+    "openai"), defaulting to "anthropic". API key is read from
+    ANTHROPIC_API_KEY or OPENAI_API_KEY accordingly.
+    """
+    provider = os.environ.get("LLM_PROVIDER", "anthropic").strip().lower()
+
+    if provider == "anthropic":
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise ValueError(
+                "ANTHROPIC_API_KEY environment variable not set. "
+                "Please set it to use the Campsite analysis features."
+            )
+        return ChatAnthropic(
+            model="claude-sonnet-4-6",
+            temperature=0.7,
+            api_key=api_key,
         )
-    return ChatOpenAI(
-        model="gpt-5-nano",
-        temperature=0.7,
-        api_key=api_key,
+
+    if provider == "openai":
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            raise ValueError(
+                "OPENAI_API_KEY environment variable not set. "
+                "Please set it to use the Campsite analysis features."
+            )
+        return ChatOpenAI(
+            model="gpt-5-nano",
+            temperature=0.7,
+            api_key=api_key,
+        )
+
+    raise ValueError(
+        f"Unknown LLM_PROVIDER: {provider!r}. Expected 'anthropic' or 'openai'."
     )
 
 
 # Lazy-loaded LLM instance
-_llm_instance: Optional[ChatOpenAI] = None
+_llm_instance: Optional[LLMClient] = None
 
 
-def get_llm_instance() -> ChatOpenAI:
+def get_llm_instance() -> LLMClient:
     """Get or create the singleton LLM instance."""
     global _llm_instance
     if _llm_instance is None:
